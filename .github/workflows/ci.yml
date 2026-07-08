@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - "lumi/**"
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test

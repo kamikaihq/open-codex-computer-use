@@ -204,9 +204,12 @@ public enum CuaDriverCLI {
     }
 
     private static func validateStatusResponse(_ response: [String: Any]) throws {
+        // Version deliberately NOT compared to this binary's: after an app update
+        // replaces the binary on disk, the old daemon must still probe as alive or
+        // the supervisor spirals (serve can't take the flock, status says down).
         guard response["error"] == nil,
               response["status"] as? String == "running",
-              response["version"] as? String == CuaDriverConstants.version,
+              (response["version"] as? String).map({ !$0.isEmpty }) == true,
               response["pid"] is NSNumber || response["pid"] is Int
         else {
             throw CLIError("daemon returned an invalid status response")
