@@ -150,7 +150,8 @@ final class CuaDriverLifecycleIntegrationTests: XCTestCase {
         }
 
         XCTAssertTrue(waitForPath(socketURL.path, timeout: 5), "server did not create socket")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: pidURL.path), "server did not create default pid file")
+        // Pid file is written just after the socket binds — wait, don't poll once.
+        XCTAssertTrue(waitForPath(pidURL.path, timeout: 5), "server did not create default pid file")
 
         let status = try runBinary(binary, arguments: ["status", "--socket", socketURL.path])
         XCTAssertEqual(status.exitCode, 0, status.stderr)
