@@ -25,6 +25,10 @@ let package = Package(
             targets: ["OpenComputerUseSmokeSuite"]
         ),
         .executable(
+            name: "cua-driver",
+            targets: ["CuaDriverCLI"]
+        ),
+        .executable(
             name: "CursorMotion",
             targets: ["CursorMotion"]
         ),
@@ -52,6 +56,11 @@ let package = Package(
             name: "OpenComputerUseSmokeSuite",
             dependencies: ["OpenComputerUseKit"],
             path: "apps/OpenComputerUseSmokeSuite/Sources/OpenComputerUseSmokeSuite"
+        ),
+        .executableTarget(
+            name: "CuaDriverCLI",
+            dependencies: ["OpenComputerUseKit"],
+            path: "apps/CuaDriverCLI/Sources/CuaDriverCLI"
         ),
         .executableTarget(
             name: "CursorMotion",

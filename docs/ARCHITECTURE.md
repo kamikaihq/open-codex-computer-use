@@ -10,6 +10,8 @@
   本地 GUI fixture app，用来承载低风险、可预测的点击/输入/滚动/拖拽验证路径。
 - `apps/OpenComputerUseSmokeSuite`
   端到端 smoke runner，会拉起 fixture 和 MCP server，并通过 JSON-RPC 真实调用 9 个 tools；同时也支持单独的 visual cursor idle smoke，用跨进程 observation file 断言等待下一次 move 时是 anchored tip + tiny rotate wobble，而不是横向漂移。
+- `apps/CuaDriverCLI`
+  面向外部 supervisor 的实验性 daemon-mode CLI，产物名固定为 `cua-driver`。它只负责解析 `serve` / `status` / `call` / `--version` 这组 M0 合约命令，实际 socket lifecycle、framing 和 verb 处理放在 `OpenComputerUseKit/Daemon`。
 - `apps/OpenComputerUseWindows`
   实验性 Windows runtime。它不依赖 Swift 或 `.app` bundle，Go CLI/MCP 入口会嵌入 PowerShell UI Automation bridge，构建产物是 `open-computer-use.exe`，并随已有 npm 包的 `dist/windows/<arch>/` bundled artifacts 分发。
 - `apps/OpenComputerUseLinux`
@@ -17,6 +19,7 @@
 - `packages/OpenComputerUseKit`
   核心库，包含：
   - MCP stdio transport 与 tool registry
+  - `cua-driver` daemon 的 Unix socket framing、single-instance lock、foreground server lifecycle 和 M0 verbs
   - app discovery
   - Accessibility / 窗口 snapshot
   - 键鼠输入模拟
@@ -57,6 +60,13 @@
   - `tools/list`
   - `tools/call`
 - `notifications/turn-ended` 是开源版显式的 turn boundary hook；收到后会清理当前进程里的 visual cursor overlay。CLI `open-computer-use turn-ended [payload]` 也会通过 macOS distributed notification 通知正在运行的 AppKit MCP 进程执行同一类清理，用于接 Codex legacy notify 的 after-agent payload。
+
+### 2.5. `cua-driver` Daemon 层
+
+- `cua-driver serve --no-relaunch --socket <path>` 是 foreground 进程，不 fork、不 daemonize、不 re-exec，主线程保留 `NSApplication` accessory runtime，Unix socket accept loop 在后台 dispatch queue 上执行。
+- daemon IPC 使用一连接一请求的 AF_UNIX stream socket，frame 为 4-byte big-endian length prefix + UTF-8 JSON body，并拒绝超过 64 MB 的 frame。
+- server 在 socket 目录内持有 `cua-driver.lock` 的 non-blocking exclusive `flock`，默认 pidfile 是同目录 `cua-driver.pid`，SIGTERM/SIGINT 会清理 socket 和 pidfile。
+- M0 verbs 只包含 `status`、`check_permissions` 和 `get_cursor_position`；`check_permissions` 的成功授权输出保持纯布尔字段，避免 granted case 出现 `false` / `denied` 这类 supervisor denial regex 关键词。
 
 ### 3. Tool Service 层
 
@@ -134,6 +144,7 @@
 ## 主要验证路径
 
 - 单元测试：`swift test`
+- daemon M0：`swift build --product cua-driver`，以及 `cua-driver serve/status/call` 的本地 Unix socket lifecycle proof
 - standalone cursor 构建：`swift build --product StandaloneCursor`
 - cursor lab 构建：`swift build --product CursorMotion`
 - 端到端 smoke：`./scripts/run-tool-smoke-tests.sh`（标准 9-tool smoke + visual cursor idle smoke；脚本默认以 headless 模式启动内部 fixture，避免在用户桌面弹出测试窗口）
