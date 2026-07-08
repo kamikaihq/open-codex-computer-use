@@ -1,4 +1,5 @@
 import Darwin
+import AppKit
 import Foundation
 import ApplicationServices
 import ImageIO
@@ -47,6 +48,96 @@ final class CuaDriverCoordinateSpaceTests: XCTestCase {
         XCTAssertEqual(space.screenshotPixelSize, CuaDriverPixelSize(width: 1568, height: 784))
         XCTAssertEqual(space.screenshotPixelToWindowPoint(CGPoint(x: 784, y: 392)), CGPoint(x: 1000, y: 500))
         XCTAssertEqual(space.screenshotPixelToGlobalPoint(CGPoint(x: 784, y: 392)), CGPoint(x: 1010, y: 520))
+    }
+
+    func testCGGlobalRectFlipsToAppKitGlobalRectUsingPrimaryScreenHeight() {
+        let primaryTopLeft = cuaDriverAppKitRect(
+            fromCGGlobalRect: CGRect(x: 0, y: 0, width: 100, height: 200),
+            primaryScreenHeight: 1000
+        )
+        XCTAssertEqual(primaryTopLeft, CGRect(x: 0, y: 800, width: 100, height: 200))
+
+        let displayBelow = cuaDriverAppKitRect(
+            fromCGGlobalRect: CGRect(x: 0, y: 1100, width: 300, height: 200),
+            primaryScreenHeight: 1000
+        )
+        XCTAssertEqual(displayBelow, CGRect(x: 0, y: -300, width: 300, height: 200))
+
+        let displayAbove = cuaDriverAppKitRect(
+            fromCGGlobalRect: CGRect(x: 200, y: -300, width: 300, height: 100),
+            primaryScreenHeight: 1000
+        )
+        XCTAssertEqual(displayAbove, CGRect(x: 200, y: 1200, width: 300, height: 100))
+
+        let displayLeft = cuaDriverAppKitRect(
+            fromCGGlobalRect: CGRect(x: -500, y: 100, width: 200, height: 200),
+            primaryScreenHeight: 1000
+        )
+        XCTAssertEqual(displayLeft, CGRect(x: -500, y: 700, width: 200, height: 200))
+    }
+}
+
+final class CuaDriverInputPrimitiveTests: XCTestCase {
+    func testKeyPressParserSupportsXdotoolStyleModifiersAndRejectsUnknownKeys() throws {
+        let parsed = try KeyPressParser.parse("cmd+shift+t")
+        XCTAssertEqual(parsed.displayValue, "t")
+        XCTAssertEqual(parsed.modifiers.count, 2)
+        XCTAssertTrue(parsed.modifiers.contains { $0.flag == .maskCommand })
+        XCTAssertTrue(parsed.modifiers.contains { $0.flag == .maskShift })
+
+        XCTAssertNoThrow(try KeyPressParser.parse("Return"))
+        XCTAssertThrowsError(try KeyPressParser.parse("not-a-key")) { error in
+            guard case ComputerUseError.invalidArguments(_) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testHexColorParserAcceptsCanonicalAndRejectsInvalidInput() throws {
+        XCTAssertEqual(cuaDriverParseHexColor("#ffefc8")?.hex, "#FFEFC8")
+        XCTAssertEqual(cuaDriverParseHexColor("00AA11")?.hex, "#00AA11")
+        XCTAssertNil(cuaDriverParseHexColor("#12345"))
+        XCTAssertNil(cuaDriverParseHexColor("#GGGGGG"))
+    }
+
+    func testDragEventSequenceUsesDownDraggedStepsAndUpInOrder() {
+        let events = cuaDriverDragEventSequence(
+            from: CGPoint(x: 0, y: 0),
+            to: CGPoint(x: 120, y: 60)
+        )
+
+        XCTAssertEqual(events.count, 14)
+        XCTAssertEqual(events.first?.type, .leftMouseDown)
+        XCTAssertEqual(events.last?.type, .leftMouseUp)
+        XCTAssertEqual(events.filter { $0.type == .leftMouseDragged }.count, 12)
+        XCTAssertEqual(events.last?.point, CGPoint(x: 120, y: 60))
+
+        let dragged = events.filter { $0.type == .leftMouseDragged }
+        XCTAssertTrue(zip(dragged, dragged.dropFirst()).allSatisfy { lhs, rhs in
+            rhs.point.x >= lhs.point.x && rhs.point.y >= lhs.point.y && lhs.delayAfter == 0.015
+        })
+    }
+
+    func testAXActionMatchingAcceptsRawAndPrettyForms() {
+        let actions = ["AXShowMenu", "AXScrollDownByPage"]
+
+        XCTAssertEqual(cuaDriverMatchingAXAction(requested: "AXShowMenu", availableActions: actions), "AXShowMenu")
+        XCTAssertEqual(cuaDriverMatchingAXAction(requested: "Show Menu", availableActions: actions), "AXShowMenu")
+        XCTAssertEqual(cuaDriverMatchingAXAction(requested: "Scroll Down", availableActions: actions), "AXScrollDownByPage")
+        XCTAssertNil(cuaDriverMatchingAXAction(requested: "Raise", availableActions: actions))
+    }
+
+    func testGlyphOverrideStorePlumbing() {
+        SoftwareCursorArtworkOverrideStore.clear()
+        XCTAssertNil(SoftwareCursorArtworkOverrideStore.current)
+
+        let image = NSImage(size: CGSize(width: 2, height: 2))
+        let color = NSColor(calibratedRed: 1, green: 0.9, blue: 0.7, alpha: 1)
+        SoftwareCursorArtworkOverrideStore.apply(glyphImage: image, bloomColor: color)
+
+        XCTAssertNotNil(SoftwareCursorArtworkOverrideStore.current?.glyphImage)
+        XCTAssertNotNil(SoftwareCursorArtworkOverrideStore.current?.bloomColor)
+        SoftwareCursorArtworkOverrideStore.clear()
     }
 }
 
@@ -223,6 +314,45 @@ final class CuaDriverVerbTests: XCTestCase {
         XCTAssertEqual(response["capture_path"] as? String, "cgwindowlist")
     }
 
+    func testScreenshotDisplayRegionAlternativeUsesRegionCapture() throws {
+        let capturer = StubWindowCapturer(
+            screenshot: CuaDriverCapturedScreenshot(
+                imageData: Data([0x89, 0x50]),
+                format: .png,
+                width: 3,
+                height: 4,
+                capturePath: "region"
+            )
+        )
+        let handler = CuaDriverVerbHandler(windowCapturer: capturer)
+
+        let response = handler.responseEnvelope(
+            verb: "screenshot",
+            args: [
+                "display_region": ["x": 10, "y": 20, "width": 30, "height": 40],
+                "format": "png",
+            ]
+        )
+
+        XCTAssertEqual(capturer.capturedRegions.map(\.bounds), [CuaDriverWindowBounds(x: 10, y: 20, width: 30, height: 40)])
+        XCTAssertTrue(capturer.capturedWindows.isEmpty)
+        XCTAssertEqual(response["capture_path"] as? String, "region")
+        XCTAssertEqual(response["width"] as? Int, 3)
+        XCTAssertEqual(response["height"] as? Int, 4)
+    }
+
+    func testScreenshotRejectsWindowAndDisplayRegionConflict() {
+        let response = CuaDriverVerbHandler().responseEnvelope(
+            verb: "screenshot",
+            args: [
+                "window_id": 7,
+                "display_region": ["x": 10, "y": 20, "width": 30, "height": 40],
+            ]
+        )
+
+        XCTAssertEqual((response["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+    }
+
     func testGetWindowStateShapesResponseAndCachesElementsForAXPressClick() throws {
         let element = FakeCachedElement(id: "button")
         let clicker = FakeElementClicker()
@@ -353,6 +483,155 @@ final class CuaDriverVerbTests: XCTestCase {
         XCTAssertTrue(coordinateClicker.requests.isEmpty)
     }
 
+    func testInputVerbsValidateArgumentsAndUseInjectedPoster() throws {
+        let poster = FakeInputEventPoster()
+        let handler = CuaDriverVerbHandler(inputEventPoster: poster)
+
+        XCTAssertEqual((handler.responseEnvelope(verb: "type_text", args: ["text": "x"])["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+        XCTAssertEqual((handler.responseEnvelope(verb: "press_key", args: ["pid": 1])["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+
+        let typed = handler.responseEnvelope(verb: "type_text", args: ["pid": 10, "text": "hello"])
+        XCTAssertEqual(typed["typed"] as? Bool, true)
+        XCTAssertEqual(poster.typed, [TypedRequest(pid: 10, text: "hello")])
+
+        let pressed = handler.responseEnvelope(verb: "press_key", args: ["pid": 10, "key": "cmd+a"])
+        XCTAssertEqual(pressed["pressed"] as? Bool, true)
+        XCTAssertEqual(poster.pressed, [KeyRequest(pid: 10, key: "cmd+a")])
+    }
+
+    func testM3InputVerbValidationMatrix() throws {
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [testWindow(windowID: 7, pid: 42)])
+        )
+
+        XCTAssertEqual((handler.responseEnvelope(verb: "set_value", args: ["pid": 42, "window_id": 7, "element_index": 0, "value": ["bad": true]])["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+        XCTAssertEqual((handler.responseEnvelope(verb: "scroll", args: ["pid": 42, "window_id": 7, "direction": "north"])["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+        XCTAssertEqual((handler.responseEnvelope(verb: "scroll", args: ["pid": 42, "window_id": 7, "direction": "down", "pages": 0])["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+        XCTAssertEqual((handler.responseEnvelope(verb: "drag", args: ["pid": 42, "window_id": 7, "from_x": 1, "from_y": 2, "to_x": 3])["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+        XCTAssertEqual((handler.responseEnvelope(verb: "drag", args: ["pid": 42, "window_id": 7, "from_x": Double.infinity, "from_y": 2, "to_x": 3, "to_y": 4])["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+        XCTAssertEqual((handler.responseEnvelope(verb: "perform_secondary_action", args: ["pid": 42, "window_id": 7, "element_index": 0])["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+
+        let stale = handler.responseEnvelope(
+            verb: "perform_secondary_action",
+            args: ["pid": 42, "window_id": 7, "element_index": 99, "action": "AXPress"]
+        )
+        XCTAssertEqual((stale["error"] as? [String: Any])?["code"] as? String, "stale_element_index")
+    }
+
+    func testSetValueUsesCachedElementAndStaleError() throws {
+        let cache = CuaDriverElementCache()
+        let element = FakeCachedElement(id: "text")
+        cache.replace(pid: 42, windowID: 7, elements: [0: element])
+        let interactor = FakeElementInteractor()
+        let handler = CuaDriverVerbHandler(elementCache: cache, elementInteractor: interactor)
+
+        let stale = handler.responseEnvelope(verb: "set_value", args: ["pid": 42, "window_id": 7, "element_index": 99, "value": "x"])
+        XCTAssertEqual((stale["error"] as? [String: Any])?["code"] as? String, "stale_element_index")
+
+        let response = handler.responseEnvelope(verb: "set_value", args: ["pid": 42, "window_id": 7, "element_index": 0, "value": "updated"])
+        XCTAssertEqual(response["set"] as? Bool, true)
+        XCTAssertEqual(interactor.setValues.map(\.id), ["text"])
+        XCTAssertEqual(interactor.setValues.first?.value as? String, "updated")
+    }
+
+    func testScrollWindowAndDragMapScreenshotCoordinatesThroughCoordinateSpace() throws {
+        let poster = FakeInputEventPoster()
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [
+                testWindow(windowID: 7, pid: 42, bounds: CuaDriverWindowBounds(x: 10, y: 20, width: 100, height: 50)),
+            ]),
+            backingScaleProvider: StubScaleProvider(scale: 2),
+            inputEventPoster: poster
+        )
+
+        let scrolled = handler.responseEnvelope(verb: "scroll", args: ["pid": 42, "window_id": 7, "direction": "down"])
+        XCTAssertEqual(scrolled["scrolled"] as? Bool, true)
+        XCTAssertEqual(poster.scrolls, [ScrollRequest(pid: 42, point: CGPoint(x: 60, y: 45), direction: "down", pages: 1)])
+
+        let dragged = handler.responseEnvelope(
+            verb: "drag",
+            args: ["pid": 42, "window_id": 7, "from_x": 0, "from_y": 0, "to_x": 200, "to_y": 100]
+        )
+        XCTAssertEqual(dragged["dragged"] as? Bool, true)
+        XCTAssertEqual(poster.drags, [DragRequest(pid: 42, start: CGPoint(x: 10, y: 20), end: CGPoint(x: 110, y: 70))])
+    }
+
+    func testScrollElementUsesAXActionWhenAvailable() throws {
+        let cache = CuaDriverElementCache()
+        let element = FakeCachedElement(id: "scroll-area")
+        cache.replace(pid: 42, windowID: 7, elements: [0: element])
+        let interactor = FakeElementInteractor()
+        interactor.actionsByID["scroll-area"] = ["AXScrollDownByPage"]
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [testWindow(windowID: 7, pid: 42)]),
+            elementCache: cache,
+            elementInteractor: interactor
+        )
+
+        let response = handler.responseEnvelope(verb: "scroll", args: ["pid": 42, "window_id": 7, "element_index": 0, "direction": "down", "pages": 2])
+
+        XCTAssertEqual(response["scrolled"] as? Bool, true)
+        XCTAssertEqual(interactor.performedActions, [
+            ActionRequest(id: "scroll-area", action: "AXScrollDownByPage"),
+            ActionRequest(id: "scroll-area", action: "AXScrollDownByPage"),
+        ])
+    }
+
+    func testPerformSecondaryActionMatchesPrettyNameAndReportsAvailableActions() throws {
+        let cache = CuaDriverElementCache()
+        let element = FakeCachedElement(id: "menu")
+        cache.replace(pid: 42, windowID: 7, elements: [0: element])
+        let interactor = FakeElementInteractor()
+        interactor.actionsByID["menu"] = ["AXShowMenu"]
+        let handler = CuaDriverVerbHandler(elementCache: cache, elementInteractor: interactor)
+
+        let response = handler.responseEnvelope(verb: "perform_secondary_action", args: ["pid": 42, "window_id": 7, "element_index": 0, "action": "Show Menu"])
+        XCTAssertEqual(response["performed"] as? Bool, true)
+        XCTAssertEqual(interactor.performedActions, [ActionRequest(id: "menu", action: "AXShowMenu")])
+
+        let unknown = handler.responseEnvelope(verb: "perform_secondary_action", args: ["pid": 42, "window_id": 7, "element_index": 0, "action": "Raise"])
+        let error = try XCTUnwrap(unknown["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "unknown_action")
+        XCTAssertTrue((error["message"] as? String)?.contains("AXShowMenu") == true)
+    }
+
+    func testCursorSessionVerbResponsesAndStyleValidation() throws {
+        let session = CuaDriverCursorSession()
+        let handler = CuaDriverVerbHandler(cursorSession: session)
+
+        let initial = handler.responseEnvelope(verb: "get_agent_cursor", args: [:])
+        XCTAssertEqual(initial["enabled"] as? Bool, false)
+        XCTAssertEqual(initial["has_custom_glyph"] as? Bool, false)
+        XCTAssertTrue(initial["bloom_color"] is NSNull)
+
+        let enabled = handler.responseEnvelope(verb: "set_agent_cursor_enabled", args: ["enabled": true])
+        XCTAssertEqual(enabled["agent_cursor_enabled"] as? Bool, true)
+
+        let badImage = handler.responseEnvelope(verb: "set_agent_cursor_style", args: ["image_path": "/does/not/exist.png"])
+        XCTAssertEqual((badImage["error"] as? [String: Any])?["code"] as? String, "invalid_cursor_image")
+
+        let badColor = handler.responseEnvelope(verb: "set_agent_cursor_style", args: ["bloom_color": "#xyzxyz"])
+        XCTAssertEqual((badColor["error"] as? [String: Any])?["code"] as? String, "invalid_cursor_color")
+
+        let imageURL = try temporaryPNG()
+        defer { try? FileManager.default.removeItem(at: imageURL) }
+        let styled = handler.responseEnvelope(
+            verb: "set_agent_cursor_style",
+            args: ["image_path": imageURL.path, "bloom_color": "ffefc8"]
+        )
+        XCTAssertEqual(styled["agent_cursor_style"] as? String, "applied")
+
+        let snapshot = handler.responseEnvelope(verb: "get_agent_cursor", args: [:])
+        XCTAssertEqual(snapshot["enabled"] as? Bool, true)
+        XCTAssertEqual(snapshot["has_custom_glyph"] as? Bool, true)
+        XCTAssertEqual(snapshot["bloom_color"] as? String, "#FFEFC8")
+
+        _ = handler.responseEnvelope(verb: "set_agent_cursor_enabled", args: ["enabled": false])
+        try cuaDriverRunOnMain {
+            SoftwareCursorArtworkOverrideStore.clear()
+        }
+    }
+
     func testSystemScreenshotCaptureSkipsWithoutScreenRecordingPermission() throws {
         guard CGPreflightScreenCaptureAccess() else {
             throw XCTSkip("Screen Recording permission is not granted")
@@ -420,6 +699,7 @@ final class CuaDriverVerbTests: XCTestCase {
     private final class StubWindowCapturer: CuaDriverWindowCapturing, @unchecked Sendable {
         private let screenshot: CuaDriverCapturedScreenshot
         var capturedWindows: [CuaDriverWindowInfo] = []
+        var capturedRegions: [CuaDriverDisplayRegion] = []
         var capturedFormats: [CuaDriverScreenshotFormat] = []
 
         init(
@@ -436,6 +716,12 @@ final class CuaDriverVerbTests: XCTestCase {
 
         func capture(window: CuaDriverWindowInfo, format: CuaDriverScreenshotFormat) throws -> CuaDriverCapturedScreenshot {
             capturedWindows.append(window)
+            capturedFormats.append(format)
+            return screenshot
+        }
+
+        func capture(displayRegion: CuaDriverDisplayRegion, format: CuaDriverScreenshotFormat) throws -> CuaDriverCapturedScreenshot {
+            capturedRegions.append(displayRegion)
             capturedFormats.append(format)
             return screenshot
         }
@@ -513,6 +799,114 @@ final class CuaDriverVerbTests: XCTestCase {
         func click(pid: Int, point: CGPoint, button: CuaDriverMouseButton, clickCount: Int) throws {
             requests.append(CoordinateClickRequest(pid: pid, point: point, button: button, clickCount: clickCount))
         }
+    }
+
+    private struct TypedRequest: Equatable {
+        let pid: Int
+        let text: String
+    }
+
+    private struct KeyRequest: Equatable {
+        let pid: Int
+        let key: String
+    }
+
+    private struct ScrollRequest: Equatable {
+        let pid: Int
+        let point: CGPoint
+        let direction: String
+        let pages: Int
+    }
+
+    private struct DragRequest: Equatable {
+        let pid: Int
+        let start: CGPoint
+        let end: CGPoint
+    }
+
+    private final class FakeInputEventPoster: CuaDriverInputEventPosting, @unchecked Sendable {
+        private(set) var typed: [TypedRequest] = []
+        private(set) var pressed: [KeyRequest] = []
+        private(set) var scrolls: [ScrollRequest] = []
+        private(set) var drags: [DragRequest] = []
+
+        func typeText(_ text: String, pid: Int) throws {
+            typed.append(TypedRequest(pid: pid, text: text))
+        }
+
+        func pressKey(_ specification: String, pid: Int) throws {
+            pressed.append(KeyRequest(pid: pid, key: specification))
+        }
+
+        func scroll(pid: Int, point: CGPoint, direction: String, pages: Int) throws {
+            scrolls.append(ScrollRequest(pid: pid, point: point, direction: direction, pages: pages))
+        }
+
+        func drag(pid: Int, from start: CGPoint, to end: CGPoint) throws {
+            drags.append(DragRequest(pid: pid, start: start, end: end))
+        }
+    }
+
+    private struct SetValueRequest {
+        let id: String
+        let value: Any
+    }
+
+    private struct ActionRequest: Equatable {
+        let id: String
+        let action: String
+    }
+
+    private final class FakeElementInteractor: CuaDriverElementInteracting, @unchecked Sendable {
+        var actionsByID: [String: [String]] = [:]
+        var centersByID: [String: CGPoint] = [:]
+        private(set) var setValues: [SetValueRequest] = []
+        private(set) var performedActions: [ActionRequest] = []
+
+        func setValue(_ value: Any, on element: any CuaDriverCachedElement) throws {
+            setValues.append(SetValueRequest(id: fakeID(element), value: value))
+        }
+
+        func availableActions(on element: any CuaDriverCachedElement) throws -> [String] {
+            actionsByID[fakeID(element)] ?? []
+        }
+
+        func performAction(_ action: String, on element: any CuaDriverCachedElement) throws {
+            performedActions.append(ActionRequest(id: fakeID(element), action: action))
+        }
+
+        func frameCenter(of element: any CuaDriverCachedElement) -> CGPoint? {
+            centersByID[fakeID(element)]
+        }
+
+        private func fakeID(_ element: any CuaDriverCachedElement) -> String {
+            (element as? FakeCachedElement)?.id ?? "unknown"
+        }
+    }
+
+    private func temporaryPNG() throws -> URL {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cua-driver-test-\(UUID().uuidString).png")
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 2,
+            pixelsHigh: 2,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            throw XCTSkip("Unable to create PNG fixture")
+        }
+        rep.setColor(.red, atX: 0, y: 0)
+        guard let data = rep.representation(using: .png, properties: [:]) else {
+            throw XCTSkip("Unable to encode PNG fixture")
+        }
+        try data.write(to: url, options: .atomic)
+        return url
     }
 
     private func testWindow(

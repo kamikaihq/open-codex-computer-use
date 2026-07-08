@@ -77,6 +77,18 @@ public struct CuaDriverWindowInfo: Equatable, Sendable {
     }
 }
 
+public struct CuaDriverDisplayRegion: Equatable, Sendable {
+    public let bounds: CuaDriverWindowBounds
+
+    public init(bounds: CuaDriverWindowBounds) {
+        self.bounds = bounds
+    }
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.init(bounds: CuaDriverWindowBounds(x: x, y: y, width: width, height: height))
+    }
+}
+
 public enum CuaDriverScreenshotFormat: String, Sendable {
     case jpeg
     case png
@@ -131,6 +143,13 @@ public protocol CuaDriverWindowProviding: Sendable {
 
 public protocol CuaDriverWindowCapturing: Sendable {
     func capture(window: CuaDriverWindowInfo, format: CuaDriverScreenshotFormat) throws -> CuaDriverCapturedScreenshot
+    func capture(displayRegion: CuaDriverDisplayRegion, format: CuaDriverScreenshotFormat) throws -> CuaDriverCapturedScreenshot
+}
+
+public extension CuaDriverWindowCapturing {
+    func capture(displayRegion: CuaDriverDisplayRegion, format: CuaDriverScreenshotFormat) throws -> CuaDriverCapturedScreenshot {
+        throw CuaDriverScreenshotError.captureFailed("Display-region capture is not implemented")
+    }
 }
 
 public struct SystemCuaDriverWindowProvider: CuaDriverWindowProviding {
@@ -191,6 +210,11 @@ public struct SystemCuaDriverWindowCapturer: CuaDriverWindowCapturing {
         }
     }
 
+    public func capture(displayRegion: CuaDriverDisplayRegion, format: CuaDriverScreenshotFormat) throws -> CuaDriverCapturedScreenshot {
+        let image = try captureDisplayRegionWithCGWindowList(displayRegion.bounds.cgRect)
+        return try encode(image: image, format: format, capturePath: "cgwindowlist_display_region")
+    }
+
     private func captureWithScreenCaptureKit(window: CuaDriverWindowInfo) throws -> CGImage {
         try BlockingAsyncBridge.run(timeout: timeout) {
             let shareableContent = try await SCShareableContent.current
@@ -220,6 +244,23 @@ public struct SystemCuaDriverWindowCapturer: CuaDriverWindowCapturing {
             [.boundsIgnoreFraming, .bestResolution]
         ), image.width > 0, image.height > 0 else {
             throw CuaDriverScreenshotError.captureFailed("Unable to capture window \(windowID)")
+        }
+
+        return image
+    }
+
+    private func captureDisplayRegionWithCGWindowList(_ region: CGRect) throws -> CGImage {
+        guard region.width > 0, region.height > 0 else {
+            throw CuaDriverScreenshotError.captureFailed("Display region must have positive width and height")
+        }
+
+        guard let image = CGWindowListCreateImage(
+            region,
+            [.optionOnScreenOnly],
+            kCGNullWindowID,
+            [.bestResolution]
+        ), image.width > 0, image.height > 0 else {
+            throw CuaDriverScreenshotError.captureFailed("Unable to capture display region")
         }
 
         return image
@@ -309,7 +350,11 @@ private struct EncodedImage {
 }
 
 private func bestEffortScaleFactor(for bounds: CGRect) -> CGFloat {
-    NSScreen.screens.first(where: { $0.frame.intersects(bounds) })?.backingScaleFactor
+    let appKitRect = cuaDriverAppKitRect(
+        fromCGGlobalRect: bounds,
+        primaryScreenHeight: cuaDriverPrimaryScreenHeight()
+    )
+    return NSScreen.screens.first(where: { $0.frame.intersects(appKitRect) })?.backingScaleFactor
         ?? NSScreen.main?.backingScaleFactor
         ?? 1
 }

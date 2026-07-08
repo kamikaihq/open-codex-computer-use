@@ -65,6 +65,16 @@ enum SoftwareCursorGlyphRenderer {
     ) {
         let drawingState = state.appKitDrawingState
 
+        if let override = SoftwareCursorArtworkOverrideStore.current {
+            drawOverride(
+                override,
+                in: bounds,
+                context: context,
+                state: drawingState
+            )
+            return
+        }
+
         if let referenceImage {
             drawReferenceImage(
                 referenceImage,
@@ -90,7 +100,8 @@ enum SoftwareCursorGlyphRenderer {
             center: fogCenter,
             pulse: pulse,
             fogOpacity: state.fogOpacity,
-            fogScale: state.fogScale
+            fogScale: state.fogScale,
+            bloomColor: nil
         )
         drawPointer(
             in: context,
@@ -98,6 +109,51 @@ enum SoftwareCursorGlyphRenderer {
             rotation: drawingState.rotation,
             clickProgress: pulse,
             cursorBodyOffset: drawingState.cursorBodyOffset,
+            boundsMidpoint: CGPoint(x: bounds.midX, y: bounds.midY)
+        )
+    }
+
+    private static func drawOverride(
+        _ override: SoftwareCursorArtworkOverride,
+        in bounds: CGRect,
+        context: CGContext,
+        state: SoftwareCursorGlyphRenderState
+    ) {
+        let pulse = state.clickProgress
+        let fogCenter = CGPoint(
+            x: bounds.midX + state.fogOffset.dx,
+            y: bounds.midY + state.fogOffset.dy
+        )
+
+        drawFog(
+            in: context,
+            center: fogCenter,
+            pulse: pulse,
+            fogOpacity: state.fogOpacity,
+            fogScale: state.fogScale,
+            bloomColor: override.bloomColor
+        )
+
+        if let image = override.glyphImage ?? referenceImage {
+            drawReferenceImage(
+                image,
+                in: bounds,
+                context: context,
+                state: state
+            )
+            return
+        }
+
+        let pointerCenter = CGPoint(
+            x: bounds.midX + SoftwareCursorGlyphMetrics.pointerOffset.x + state.cursorBodyOffset.dx,
+            y: bounds.midY + SoftwareCursorGlyphMetrics.pointerOffset.y + state.cursorBodyOffset.dy + (pulse * 0.35)
+        )
+        drawPointer(
+            in: context,
+            center: pointerCenter,
+            rotation: state.rotation,
+            clickProgress: pulse,
+            cursorBodyOffset: state.cursorBodyOffset,
             boundsMidpoint: CGPoint(x: bounds.midX, y: bounds.midY)
         )
     }
@@ -132,17 +188,28 @@ enum SoftwareCursorGlyphRenderer {
         center: CGPoint,
         pulse: CGFloat,
         fogOpacity: CGFloat,
-        fogScale: CGFloat
+        fogScale: CGFloat,
+        bloomColor: NSColor?
     ) {
         let radius = ((66 * fogScale) / 2) + (pulse * 1.2)
         let glowRadius = radius * (0.30 + (pulse * 0.025))
         let opacityMultiplier = max(0.28, min(fogOpacity / 0.12, 2.2))
-        let colors = [
-            NSColor(calibratedRed: 0.38, green: 0.36, blue: 0.35, alpha: (0.40 + (pulse * 0.02)) * opacityMultiplier).cgColor,
-            NSColor(calibratedRed: 0.43, green: 0.41, blue: 0.40, alpha: (0.28 + (pulse * 0.015)) * opacityMultiplier).cgColor,
-            NSColor(calibratedRed: 0.46, green: 0.44, blue: 0.43, alpha: 0.11 * opacityMultiplier).cgColor,
-            NSColor(calibratedWhite: 0.60, alpha: 0.0).cgColor,
-        ] as CFArray
+        let colors: CFArray
+        if let bloomColor {
+            colors = [
+                bloomColor.withAlphaComponent((0.42 + (pulse * 0.02)) * opacityMultiplier).cgColor,
+                bloomColor.withAlphaComponent((0.28 + (pulse * 0.015)) * opacityMultiplier).cgColor,
+                bloomColor.withAlphaComponent(0.11 * opacityMultiplier).cgColor,
+                bloomColor.withAlphaComponent(0.0).cgColor,
+            ] as CFArray
+        } else {
+            colors = [
+                NSColor(calibratedRed: 0.38, green: 0.36, blue: 0.35, alpha: (0.40 + (pulse * 0.02)) * opacityMultiplier).cgColor,
+                NSColor(calibratedRed: 0.43, green: 0.41, blue: 0.40, alpha: (0.28 + (pulse * 0.015)) * opacityMultiplier).cgColor,
+                NSColor(calibratedRed: 0.46, green: 0.44, blue: 0.43, alpha: 0.11 * opacityMultiplier).cgColor,
+                NSColor(calibratedWhite: 0.60, alpha: 0.0).cgColor,
+            ] as CFArray
+        }
         let locations: [CGFloat] = [0, 0.50, 0.82, 1]
         let colorSpace = CGColorSpaceCreateDeviceRGB()
 
@@ -161,11 +228,20 @@ enum SoftwareCursorGlyphRenderer {
         )
         context.restoreGState()
 
-        let coreColors = [
-            NSColor(calibratedRed: 0.41, green: 0.39, blue: 0.38, alpha: (0.020 + (pulse * 0.006)) * opacityMultiplier).cgColor,
-            NSColor(calibratedRed: 0.44, green: 0.41, blue: 0.40, alpha: 0.008 * opacityMultiplier).cgColor,
-            NSColor(calibratedWhite: 0.80, alpha: 0.0).cgColor,
-        ] as CFArray
+        let coreColors: CFArray
+        if let bloomColor {
+            coreColors = [
+                bloomColor.withAlphaComponent((0.030 + (pulse * 0.006)) * opacityMultiplier).cgColor,
+                bloomColor.withAlphaComponent(0.012 * opacityMultiplier).cgColor,
+                bloomColor.withAlphaComponent(0.0).cgColor,
+            ] as CFArray
+        } else {
+            coreColors = [
+                NSColor(calibratedRed: 0.41, green: 0.39, blue: 0.38, alpha: (0.020 + (pulse * 0.006)) * opacityMultiplier).cgColor,
+                NSColor(calibratedRed: 0.44, green: 0.41, blue: 0.40, alpha: 0.008 * opacityMultiplier).cgColor,
+                NSColor(calibratedWhite: 0.80, alpha: 0.0).cgColor,
+            ] as CFArray
+        }
         let coreLocations: [CGFloat] = [0, 0.62, 1]
         guard let coreGradient = CGGradient(colorsSpace: colorSpace, colors: coreColors, locations: coreLocations) else {
             return

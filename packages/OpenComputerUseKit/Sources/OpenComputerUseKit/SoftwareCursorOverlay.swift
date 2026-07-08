@@ -270,6 +270,10 @@ enum SoftwareCursorOverlay {
         scheduleHide(after: visualCursorPostInteractionIdleTimeout())
     }
 
+    static func currentTipPosition() -> CGPoint? {
+        displayedTipPosition
+    }
+
     static func reset() {
         stopIdleAnimation()
         cancelPendingHide()

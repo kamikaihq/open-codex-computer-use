@@ -99,6 +99,46 @@ public func cuaDriverCoordinateSpace(
     )
 }
 
+public func cuaDriverAppKitRect(
+    fromCGGlobalRect rect: CGRect,
+    primaryScreenHeight: CGFloat
+) -> CGRect {
+    CGRect(
+        x: rect.minX,
+        y: primaryScreenHeight - rect.maxY,
+        width: rect.width,
+        height: rect.height
+    )
+}
+
+public func cuaDriverCGGlobalPoint(
+    fromAppKitGlobalPoint point: CGPoint,
+    primaryScreenHeight: CGFloat
+) -> CGPoint {
+    CGPoint(
+        x: point.x,
+        y: primaryScreenHeight - point.y
+    )
+}
+
+public func cuaDriverAppKitGlobalPoint(
+    fromCGGlobalPoint point: CGPoint,
+    primaryScreenHeight: CGFloat
+) -> CGPoint {
+    CGPoint(
+        x: point.x,
+        y: primaryScreenHeight - point.y
+    )
+}
+
+public func cuaDriverPrimaryScreenHeight() -> CGFloat {
+    let height = CGDisplayBounds(CGMainDisplayID()).height
+    if height > 0 {
+        return height
+    }
+    return NSScreen.main?.frame.height ?? NSScreen.screens.first?.frame.height ?? 0
+}
+
 public protocol CuaDriverBackingScaleProviding: Sendable {
     func backingScale(for bounds: CuaDriverWindowBounds) -> CGFloat
 }
@@ -107,8 +147,11 @@ public struct SystemCuaDriverBackingScaleProvider: CuaDriverBackingScaleProvidin
     public init() {}
 
     public func backingScale(for bounds: CuaDriverWindowBounds) -> CGFloat {
-        let rect = bounds.cgRect
-        return NSScreen.screens.first(where: { $0.frame.intersects(rect) })?.backingScaleFactor
+        let appKitRect = cuaDriverAppKitRect(
+            fromCGGlobalRect: bounds.cgRect,
+            primaryScreenHeight: cuaDriverPrimaryScreenHeight()
+        )
+        return NSScreen.screens.first(where: { $0.frame.intersects(appKitRect) })?.backingScaleFactor
             ?? NSScreen.main?.backingScaleFactor
             ?? 1
     }

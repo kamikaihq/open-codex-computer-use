@@ -66,11 +66,13 @@
 - `cua-driver serve --no-relaunch --socket <path>` 是 foreground 进程，不 fork、不 daemonize、不 re-exec，主线程保留 `NSApplication` accessory runtime，Unix socket accept loop 在后台 dispatch queue 上执行。
 - daemon IPC 使用一连接一请求的 AF_UNIX stream socket，frame 为 4-byte big-endian length prefix + UTF-8 JSON body，并拒绝超过 64 MB 的 frame。
 - server 在 socket 目录内持有 `cua-driver.lock` 的 non-blocking exclusive `flock`，默认 pidfile 是同目录 `cua-driver.pid`，SIGTERM/SIGINT 会清理 socket 和 pidfile。
-- daemon verbs 当前包含 `status`、`check_permissions`、`get_cursor_position`、`list_windows`、`screenshot`、`get_window_state` 和 `click`；`check_permissions` 的成功授权输出保持纯布尔字段，避免 granted case 出现 `false` / `denied` 这类 supervisor denial regex 关键词。
+- daemon verbs 当前包含 `status`、`check_permissions`、`get_cursor_position`、`list_windows`、`screenshot`、`get_window_state`、`click`、`type_text`、`set_value`、`press_key`、`scroll`、`drag`、`perform_secondary_action`、`set_agent_cursor_enabled`、`set_agent_cursor_style` 和 `get_agent_cursor`；`check_permissions` 的成功授权输出保持纯布尔字段，避免 granted case 出现 `false` / `denied` 这类 supervisor denial regex 关键词。
 - `list_windows` 通过 `CGWindowListCopyWindowInfo(.optionAll)` 暴露 layer 0 real windows，并在每个条目上保留 `is_on_screen`，供外部 supervisor 选择可截图窗口。
-- `screenshot` 优先用 ScreenCaptureKit `SCScreenshotManager` 按 `window_id` 捕获；任何 SCK 失败都会 fallback 到 `CGWindowListCreateImage`，并在响应里标明 `capture_path` 为 `sck` 或 `cgwindowlist`。CLI `call --screenshot-out-file` 会把响应里的 base64 `image` 解码落盘。
+- `screenshot` 优先用 ScreenCaptureKit `SCScreenshotManager` 按 `window_id` 捕获；任何 SCK 失败都会 fallback 到 `CGWindowListCreateImage`，并在响应里标明 `capture_path` 为 `sck` 或 `cgwindowlist`。它也支持 `display_region` 直接截 CG top-left-origin global rect，这条路径用 `CGWindowListCreateImage(.optionOnScreenOnly)` 包含 overlay windows。CLI `call --screenshot-out-file` 会把响应里的 base64 `image` 解码落盘。
 - `get_window_state` 通过目标 `pid` 的 `AXWindows` 解析指定 `window_id`，优先使用 `_AXUIElementGetWindow`，不可用时用 CGWindowList 的 frame/title 回退匹配；读取树前会 best-effort 打开 `AXManualAccessibility` / `AXEnhancedUserInterface`，并只遍历该窗口 subtree。响应里的 `screenshot_width` / `screenshot_height` 是 daemon `click` 的坐标空间：窗口 bounds(point) 乘 backing scale 得到 raw pixels，再按最长边不超过 1568 等比缩小。
-- daemon `click` 支持上一轮 `get_window_state` 产生的 `element_index` 和响应截图空间里的 `x/y` 坐标。`element_index` 走缓存的 AX element `kAXPressAction`，坐标点击走 `CGEvent.postToPid(pid)` 定向 mouseDown/mouseUp，不 raise/focus window，也不移动用户真实指针。
+- daemon `click`、`drag` 和坐标类动作使用同一套 `CuaDriverCoordinateSpace`：输入坐标是 `get_window_state` 报告的 downscaled screenshot space，再映射回 window-local points 和 CG global points。multi-display backing scale lookup 会先把 CG top-left-origin rect 翻到 AppKit bottom-left-origin rect，再与 `NSScreen.frame` 相交，避免混合 DPI 屏选错 scale。
+- daemon 输入 verbs 默认走后台定向事件：`click` / `drag` / `scroll` 用 `CGEvent.postToPid(pid)`，`type_text` 复用主线 64 UTF-16 units chunked unicode keyboard events，`press_key` 复用主线 xdotool-style parser；`set_value`、`perform_secondary_action` 和 element scroll 优先走缓存 AX element。
+- daemon 的 Lumi agent cursor 是进程内 session state，默认每次 daemon 启动为 off，由 supervisor 通过 `set_agent_cursor_enabled` / `set_agent_cursor_style` 重放；它只 gate daemon verbs，不改变 MCP path 的 `OPEN_COMPUTER_USE_VISUAL_CURSOR` 默认行为。启用时 daemon 会把 CG global target point 翻到 AppKit global point 后驱动既有 `SoftwareCursorOverlay`，并可通过 additive glyph override seam 替换 glyph image 和 bloom color；未设置 override 时默认 renderer path 保持不变。
 
 ### 3. Tool Service 层
 
