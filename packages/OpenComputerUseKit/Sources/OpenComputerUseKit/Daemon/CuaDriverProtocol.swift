@@ -63,6 +63,12 @@ public struct CuaDriverVerbHandler: Sendable {
     private let permissionChecker: any CuaDriverPermissionChecking
     private let windowProvider: any CuaDriverWindowProviding
     private let windowCapturer: any CuaDriverWindowCapturing
+    private let backingScaleProvider: any CuaDriverBackingScaleProviding
+    private let axWindowResolver: any CuaDriverAXWindowResolving
+    private let windowStateRenderer: any CuaDriverWindowStateRendering
+    private let elementCache: CuaDriverElementCache
+    private let elementClicker: any CuaDriverElementClicking
+    private let coordinateClicker: any CuaDriverCoordinateClicking
     private let pidProvider: @Sendable () -> Int32
     private let cursorPositionProvider: @Sendable () -> CGPoint?
 
@@ -70,12 +76,24 @@ public struct CuaDriverVerbHandler: Sendable {
         permissionChecker: any CuaDriverPermissionChecking = SystemCuaDriverPermissionChecker(),
         windowProvider: any CuaDriverWindowProviding = SystemCuaDriverWindowProvider(),
         windowCapturer: any CuaDriverWindowCapturing = SystemCuaDriverWindowCapturer(),
+        backingScaleProvider: any CuaDriverBackingScaleProviding = SystemCuaDriverBackingScaleProvider(),
+        axWindowResolver: any CuaDriverAXWindowResolving = SystemCuaDriverAXWindowResolver(),
+        windowStateRenderer: any CuaDriverWindowStateRendering = SystemCuaDriverWindowStateRenderer(),
+        elementCache: CuaDriverElementCache = CuaDriverElementCache(),
+        elementClicker: any CuaDriverElementClicking = SystemCuaDriverElementClicker(),
+        coordinateClicker: any CuaDriverCoordinateClicking = SystemCuaDriverCoordinateClicker(),
         pidProvider: @escaping @Sendable () -> Int32 = { getpid() },
         cursorPositionProvider: @escaping @Sendable () -> CGPoint? = { CGEvent(source: nil)?.location }
     ) {
         self.permissionChecker = permissionChecker
         self.windowProvider = windowProvider
         self.windowCapturer = windowCapturer
+        self.backingScaleProvider = backingScaleProvider
+        self.axWindowResolver = axWindowResolver
+        self.windowStateRenderer = windowStateRenderer
+        self.elementCache = elementCache
+        self.elementClicker = elementClicker
+        self.coordinateClicker = coordinateClicker
         self.pidProvider = pidProvider
         self.cursorPositionProvider = cursorPositionProvider
     }
@@ -132,6 +150,10 @@ public struct CuaDriverVerbHandler: Sendable {
             ]
         case "screenshot":
             return screenshotResponse(args: args)
+        case "get_window_state":
+            return windowStateResponse(args: args)
+        case "click":
+            return clickResponse(args: args)
         default:
             return errorEnvelope(code: "unknown_verb", message: "Unknown verb: \(verb)")
         }
@@ -179,6 +201,125 @@ public struct CuaDriverVerbHandler: Sendable {
             )
         }
     }
+
+    private func windowStateResponse(args: [String: Any]) -> [String: Any] {
+        guard let pid = intArgument(args["pid"]) else {
+            return errorEnvelope(code: "invalid_request", message: "get_window_state requires integer field 'pid'")
+        }
+        guard let windowID = intArgument(args["window_id"]) else {
+            return errorEnvelope(code: "invalid_request", message: "get_window_state requires integer field 'window_id'")
+        }
+        guard let window = windowProvider.window(windowID: windowID, pid: pid) else {
+            return errorEnvelope(code: "window_not_found", message: "Window not found: \(windowID)")
+        }
+
+        do {
+            let resolvedWindow = try axWindowResolver.resolveWindow(pid: pid, windowID: windowID, windowInfo: window)
+            let snapshot = try windowStateRenderer.render(window: resolvedWindow, windowInfo: window)
+            elementCache.replace(pid: pid, windowID: windowID, elements: snapshot.elements)
+
+            let coordinateSpace = cuaDriverCoordinateSpace(
+                windowBounds: window.bounds,
+                backingScale: backingScaleProvider.backingScale(for: window.bounds)
+            )
+
+            return [
+                "tree": snapshot.tree,
+                "screenshot_width": coordinateSpace.screenshotWidth,
+                "screenshot_height": coordinateSpace.screenshotHeight,
+                "window_id": window.windowID,
+                "pid": window.pid,
+                "title": resolvedWindow.title ?? window.title,
+                "app_name": resolvedWindow.appName ?? window.appName,
+            ]
+        } catch let error as CuaDriverAXWindowBridgeError {
+            return errorEnvelope(code: windowStateErrorCode(error), message: error.localizedDescription)
+        } catch {
+            return errorEnvelope(
+                code: "window_state_failed",
+                message: (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            )
+        }
+    }
+
+    private func clickResponse(args: [String: Any]) -> [String: Any] {
+        guard let pid = intArgument(args["pid"]) else {
+            return errorEnvelope(code: "invalid_request", message: "click requires integer field 'pid'")
+        }
+        guard let windowID = intArgument(args["window_id"]) else {
+            return errorEnvelope(code: "invalid_request", message: "click requires integer field 'window_id'")
+        }
+
+        if let elementIndex = intArgument(args["element_index"]) {
+            guard let element = elementCache.element(pid: pid, windowID: windowID, index: elementIndex) else {
+                return errorEnvelope(
+                    code: "stale_element_index",
+                    message: "element_index \(elementIndex) not found; call get_window_state again"
+                )
+            }
+
+            do {
+                try elementClicker.press(element)
+                return [
+                    "clicked": true,
+                    "method": "ax_press",
+                ]
+            } catch {
+                return errorEnvelope(
+                    code: "click_failed",
+                    message: (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                )
+            }
+        }
+
+        guard let x = doubleArgument(args["x"]), let y = doubleArgument(args["y"]) else {
+            return errorEnvelope(code: "invalid_request", message: "click requires either 'element_index' or numeric fields 'x' and 'y'")
+        }
+        guard x.isFinite, y.isFinite else {
+            return errorEnvelope(code: "invalid_request", message: "click coordinates must be finite numbers")
+        }
+
+        let clickCount = intArgument(args["click_count"]) ?? 1
+        guard clickCount > 0 else {
+            return errorEnvelope(code: "invalid_request", message: "click_count must be > 0")
+        }
+
+        let buttonName = (args["button"] as? String ?? "left").lowercased()
+        guard let button = CuaDriverMouseButton(rawValue: buttonName) else {
+            return errorEnvelope(code: "invalid_request", message: "button must be 'left' or 'right'")
+        }
+        guard let window = windowProvider.window(windowID: windowID, pid: pid) else {
+            return errorEnvelope(code: "window_not_found", message: "Window not found: \(windowID)")
+        }
+
+        let coordinateSpace = cuaDriverCoordinateSpace(
+            windowBounds: window.bounds,
+            backingScale: backingScaleProvider.backingScale(for: window.bounds)
+        )
+        let globalPoint = coordinateSpace.screenshotPixelToGlobalPoint(CGPoint(x: x, y: y))
+
+        do {
+            try coordinateClicker.click(pid: pid, point: globalPoint, button: button, clickCount: clickCount)
+            return [
+                "clicked": true,
+                "method": "coordinate",
+            ]
+        } catch {
+            return errorEnvelope(
+                code: "click_failed",
+                message: (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            )
+        }
+    }
+
+    private func windowStateErrorCode(_ error: CuaDriverAXWindowBridgeError) -> String {
+        switch error {
+        case .axWindowNotFound:
+            return "ax_window_not_found"
+        default:
+            return "window_state_failed"
+        }
+    }
 }
 
 private func intArgument(_ value: Any?) -> Int? {
@@ -187,6 +328,19 @@ private func intArgument(_ value: Any?) -> Int? {
         return int
     case let number as NSNumber:
         return number.intValue
+    default:
+        return nil
+    }
+}
+
+private func doubleArgument(_ value: Any?) -> Double? {
+    switch value {
+    case let double as Double:
+        return double
+    case let int as Int:
+        return Double(int)
+    case let number as NSNumber:
+        return number.doubleValue
     default:
         return nil
     }

@@ -5,6 +5,51 @@ import ImageIO
 import XCTest
 @testable import OpenComputerUseKit
 
+final class CuaDriverCoordinateSpaceTests: XCTestCase {
+    func testRoundTripsRawPixelsAtOneAndTwoXBackingScale() {
+        let cases: [(CuaDriverWindowBounds, CGFloat)] = [
+            (CuaDriverWindowBounds(x: 0, y: 0, width: 1400, height: 721), 1.0),
+            (CuaDriverWindowBounds(x: 10, y: 20, width: 1600.5, height: 917.25), 2.0),
+        ]
+
+        for (bounds, backingScale) in cases {
+            let space = cuaDriverCoordinateSpace(windowBounds: bounds, backingScale: backingScale)
+            let rawPoint = CGPoint(
+                x: CGFloat(space.rawPixelSize.width) * 0.37,
+                y: CGFloat(space.rawPixelSize.height) * 0.61
+            )
+
+            let pngPoint = space.rawPixelToScreenshotPixel(rawPoint)
+            let roundTripped = space.screenshotPixelToRawPixel(pngPoint)
+
+            XCTAssertLessThanOrEqual(abs(roundTripped.x - rawPoint.x), 1)
+            XCTAssertLessThanOrEqual(abs(roundTripped.y - rawPoint.y), 1)
+        }
+    }
+
+    func testTinyWindowUsesRawPixelIdentitySize() {
+        let space = cuaDriverCoordinateSpace(
+            windowBounds: CuaDriverWindowBounds(x: 0, y: 0, width: 100, height: 80),
+            backingScale: 2.0
+        )
+
+        XCTAssertEqual(space.rawPixelSize, CuaDriverPixelSize(width: 200, height: 160))
+        XCTAssertEqual(space.screenshotPixelSize, CuaDriverPixelSize(width: 200, height: 160))
+        XCTAssertEqual(space.rawPixelToScreenshotPixel(CGPoint(x: 17, y: 29)), CGPoint(x: 17, y: 29))
+    }
+
+    func testDownscalesLongestSideToLimitAndMapsBackToGlobalPoints() {
+        let space = cuaDriverCoordinateSpace(
+            windowBounds: CuaDriverWindowBounds(x: 10, y: 20, width: 2000, height: 1000),
+            backingScale: 1.0
+        )
+
+        XCTAssertEqual(space.screenshotPixelSize, CuaDriverPixelSize(width: 1568, height: 784))
+        XCTAssertEqual(space.screenshotPixelToWindowPoint(CGPoint(x: 784, y: 392)), CGPoint(x: 1000, y: 500))
+        XCTAssertEqual(space.screenshotPixelToGlobalPoint(CGPoint(x: 784, y: 392)), CGPoint(x: 1010, y: 520))
+    }
+}
+
 final class CuaDriverFramingTests: XCTestCase {
     func testFrameRoundTrip() throws {
         let body = Data(#"{"verb":"status","args":{}}"#.utf8)
@@ -178,6 +223,136 @@ final class CuaDriverVerbTests: XCTestCase {
         XCTAssertEqual(response["capture_path"] as? String, "cgwindowlist")
     }
 
+    func testGetWindowStateShapesResponseAndCachesElementsForAXPressClick() throws {
+        let element = FakeCachedElement(id: "button")
+        let clicker = FakeElementClicker()
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [
+                testWindow(windowID: 7, pid: 42, bounds: CuaDriverWindowBounds(x: 10, y: 20, width: 2000, height: 1000)),
+            ]),
+            backingScaleProvider: StubScaleProvider(scale: 1.0),
+            axWindowResolver: FakeResolver(),
+            windowStateRenderer: SequenceWindowStateRenderer(snapshots: [
+                CuaDriverWindowStateSnapshot(
+                    tree: "button Save [element_index 0]",
+                    elements: [0: element]
+                ),
+            ]),
+            elementClicker: clicker
+        )
+
+        let state = handler.responseEnvelope(verb: "get_window_state", args: ["pid": 42, "window_id": 7])
+        XCTAssertEqual(state["tree"] as? String, "button Save [element_index 0]")
+        XCTAssertEqual(state["screenshot_width"] as? Int, 1568)
+        XCTAssertEqual(state["screenshot_height"] as? Int, 784)
+        XCTAssertEqual(state["window_id"] as? Int, 7)
+        XCTAssertEqual(state["pid"] as? Int, 42)
+        XCTAssertEqual(state["title"] as? String, "Resolved")
+        XCTAssertEqual(state["app_name"] as? String, "Example")
+
+        let click = handler.responseEnvelope(verb: "click", args: ["pid": 42, "window_id": 7, "element_index": 0])
+        XCTAssertEqual(click["clicked"] as? Bool, true)
+        XCTAssertEqual(click["method"] as? String, "ax_press")
+        XCTAssertEqual(clicker.pressedIDs, ["button"])
+    }
+
+    func testElementCacheReplacesOnRefreshAndReturnsStaleIndexError() throws {
+        let clicker = FakeElementClicker()
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [testWindow(windowID: 7, pid: 42)]),
+            axWindowResolver: FakeResolver(),
+            windowStateRenderer: SequenceWindowStateRenderer(snapshots: [
+                CuaDriverWindowStateSnapshot(tree: "button Old [element_index 1]", elements: [1: FakeCachedElement(id: "old")]),
+                CuaDriverWindowStateSnapshot(tree: "button New [element_index 2]", elements: [2: FakeCachedElement(id: "new")]),
+            ]),
+            elementClicker: clicker
+        )
+
+        _ = handler.responseEnvelope(verb: "get_window_state", args: ["pid": 42, "window_id": 7])
+        _ = handler.responseEnvelope(verb: "get_window_state", args: ["pid": 42, "window_id": 7])
+
+        let stale = handler.responseEnvelope(verb: "click", args: ["pid": 42, "window_id": 7, "element_index": 1])
+        let staleError = try XCTUnwrap(stale["error"] as? [String: Any])
+        XCTAssertEqual(staleError["code"] as? String, "stale_element_index")
+        XCTAssertEqual(staleError["message"] as? String, "element_index 1 not found; call get_window_state again")
+
+        let fresh = handler.responseEnvelope(verb: "click", args: ["pid": 42, "window_id": 7, "element_index": 2])
+        XCTAssertEqual(fresh["clicked"] as? Bool, true)
+        XCTAssertEqual(clicker.pressedIDs, ["new"])
+    }
+
+    func testElementCacheIsIsolatedByPidAndWindowID() {
+        let cache = CuaDriverElementCache()
+        let first = FakeCachedElement(id: "first")
+        let second = FakeCachedElement(id: "second")
+
+        cache.replace(pid: 10, windowID: 1, elements: [0: first])
+        cache.replace(pid: 10, windowID: 2, elements: [0: second])
+
+        XCTAssertEqual((cache.element(pid: 10, windowID: 1, index: 0) as? FakeCachedElement)?.id, "first")
+        XCTAssertEqual((cache.element(pid: 10, windowID: 2, index: 0) as? FakeCachedElement)?.id, "second")
+        XCTAssertNil(cache.element(pid: 11, windowID: 1, index: 0))
+    }
+
+    func testClickCoordinateMapsPNGSpaceToWindowGlobalPoint() throws {
+        let clicker = FakeCoordinateClicker()
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [
+                testWindow(windowID: 7, pid: 42, bounds: CuaDriverWindowBounds(x: 10, y: 20, width: 100, height: 50)),
+            ]),
+            backingScaleProvider: StubScaleProvider(scale: 2.0),
+            coordinateClicker: clicker
+        )
+
+        let response = handler.responseEnvelope(
+            verb: "click",
+            args: ["pid": 42, "window_id": 7, "x": 100, "y": 50, "button": "right", "click_count": 2]
+        )
+
+        XCTAssertEqual(response["clicked"] as? Bool, true)
+        XCTAssertEqual(response["method"] as? String, "coordinate")
+        XCTAssertEqual(clicker.requests.map(\.pid), [42])
+        XCTAssertEqual(clicker.requests.map(\.button), [.right])
+        XCTAssertEqual(clicker.requests.map(\.clickCount), [2])
+        XCTAssertEqual(clicker.requests.first?.point, CGPoint(x: 60, y: 45))
+    }
+
+    func testClickValidationMatrixAndElementIndexPrecedence() throws {
+        let cache = CuaDriverElementCache()
+        let element = FakeCachedElement(id: "wins")
+        cache.replace(pid: 42, windowID: 7, elements: [3: element])
+        let elementClicker = FakeElementClicker()
+        let coordinateClicker = FakeCoordinateClicker()
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [testWindow(windowID: 7, pid: 42)]),
+            elementCache: cache,
+            elementClicker: elementClicker,
+            coordinateClicker: coordinateClicker
+        )
+
+        let missingPid = handler.responseEnvelope(verb: "click", args: ["window_id": 7, "x": 1, "y": 2])
+        XCTAssertEqual((missingPid["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+
+        let missingWindow = handler.responseEnvelope(verb: "click", args: ["pid": 42, "x": 1, "y": 2])
+        XCTAssertEqual((missingWindow["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+
+        let missingTarget = handler.responseEnvelope(verb: "click", args: ["pid": 42, "window_id": 7, "x": 1])
+        XCTAssertEqual((missingTarget["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+
+        let invalidButton = handler.responseEnvelope(verb: "click", args: ["pid": 42, "window_id": 7, "x": 1, "y": 2, "button": "middle"])
+        XCTAssertEqual((invalidButton["error"] as? [String: Any])?["code"] as? String, "invalid_request")
+        XCTAssertEqual((invalidButton["error"] as? [String: Any])?["message"] as? String, "button must be 'left' or 'right'")
+
+        let elementWins = handler.responseEnvelope(
+            verb: "click",
+            args: ["pid": 42, "window_id": 7, "element_index": 3, "x": 1, "y": 2, "button": "middle"]
+        )
+        XCTAssertEqual(elementWins["clicked"] as? Bool, true)
+        XCTAssertEqual(elementWins["method"] as? String, "ax_press")
+        XCTAssertEqual(elementClicker.pressedIDs, ["wins"])
+        XCTAssertTrue(coordinateClicker.requests.isEmpty)
+    }
+
     func testSystemScreenshotCaptureSkipsWithoutScreenRecordingPermission() throws {
         guard CGPreflightScreenCaptureAccess() else {
             throw XCTSkip("Screen Recording permission is not granted")
@@ -194,6 +369,32 @@ final class CuaDriverVerbTests: XCTestCase {
         XCTAssertGreaterThan(screenshot.width, 0)
         XCTAssertGreaterThan(screenshot.height, 0)
         XCTAssertNotNil(CGImageSourceCreateWithData(screenshot.imageData as CFData, nil))
+    }
+
+    func testSystemAXWindowStateSmokeSkipsWithoutTrustedAccessibility() throws {
+        guard AXIsProcessTrusted() else {
+            throw XCTSkip("Accessibility permission is not granted")
+        }
+
+        let provider = SystemCuaDriverWindowProvider()
+        let resolver = SystemCuaDriverAXWindowResolver()
+        let renderer = SystemCuaDriverWindowStateRenderer()
+        let windows = provider.listWindows(pid: nil).filter(\.isOnScreen)
+
+        for window in windows.prefix(20) {
+            do {
+                let resolved = try resolver.resolveWindow(pid: window.pid, windowID: window.windowID, windowInfo: window)
+                let snapshot = try renderer.render(window: resolved, windowInfo: window)
+                if !snapshot.tree.isEmpty {
+                    XCTAssertTrue(snapshot.tree.contains("window") || !snapshot.elements.isEmpty)
+                    return
+                }
+            } catch {
+                continue
+            }
+        }
+
+        throw XCTSkip("No AX-resolvable on-screen window was available")
     }
 
     private struct StubPermissionChecker: CuaDriverPermissionChecking {
@@ -240,13 +441,92 @@ final class CuaDriverVerbTests: XCTestCase {
         }
     }
 
-    private func testWindow(windowID: Int, pid: Int, isOnScreen: Bool = true) -> CuaDriverWindowInfo {
+    private struct StubScaleProvider: CuaDriverBackingScaleProviding {
+        let scale: CGFloat
+
+        func backingScale(for bounds: CuaDriverWindowBounds) -> CGFloat {
+            scale
+        }
+    }
+
+    private final class FakeResolvedWindow: CuaDriverResolvedWindow, @unchecked Sendable {
+        let pid: Int
+        let windowID: Int
+        let title: String?
+        let appName: String?
+
+        init(pid: Int, windowID: Int, title: String? = "Resolved", appName: String? = "Example") {
+            self.pid = pid
+            self.windowID = windowID
+            self.title = title
+            self.appName = appName
+        }
+    }
+
+    private struct FakeResolver: CuaDriverAXWindowResolving {
+        func resolveWindow(pid: Int, windowID: Int, windowInfo: CuaDriverWindowInfo) throws -> any CuaDriverResolvedWindow {
+            FakeResolvedWindow(pid: pid, windowID: windowID)
+        }
+    }
+
+    private final class FakeCachedElement: CuaDriverCachedElement, @unchecked Sendable {
+        let id: String
+
+        init(id: String) {
+            self.id = id
+        }
+    }
+
+    private final class SequenceWindowStateRenderer: CuaDriverWindowStateRendering, @unchecked Sendable {
+        private var snapshots: [CuaDriverWindowStateSnapshot]
+
+        init(snapshots: [CuaDriverWindowStateSnapshot]) {
+            self.snapshots = snapshots
+        }
+
+        func render(window: any CuaDriverResolvedWindow, windowInfo: CuaDriverWindowInfo) throws -> CuaDriverWindowStateSnapshot {
+            if snapshots.count > 1 {
+                return snapshots.removeFirst()
+            }
+            return snapshots.first ?? CuaDriverWindowStateSnapshot(tree: "", elements: [:])
+        }
+    }
+
+    private final class FakeElementClicker: CuaDriverElementClicking, @unchecked Sendable {
+        private(set) var pressedIDs: [String] = []
+
+        func press(_ element: any CuaDriverCachedElement) throws {
+            pressedIDs.append((element as? FakeCachedElement)?.id ?? "unknown")
+        }
+    }
+
+    private struct CoordinateClickRequest: Equatable {
+        let pid: Int
+        let point: CGPoint
+        let button: CuaDriverMouseButton
+        let clickCount: Int
+    }
+
+    private final class FakeCoordinateClicker: CuaDriverCoordinateClicking, @unchecked Sendable {
+        private(set) var requests: [CoordinateClickRequest] = []
+
+        func click(pid: Int, point: CGPoint, button: CuaDriverMouseButton, clickCount: Int) throws {
+            requests.append(CoordinateClickRequest(pid: pid, point: point, button: button, clickCount: clickCount))
+        }
+    }
+
+    private func testWindow(
+        windowID: Int,
+        pid: Int,
+        isOnScreen: Bool = true,
+        bounds: CuaDriverWindowBounds = CuaDriverWindowBounds(x: 1, y: 2, width: 100, height: 80)
+    ) -> CuaDriverWindowInfo {
         CuaDriverWindowInfo(
             windowID: windowID,
             pid: pid,
             appName: "Example",
             title: "Window \(windowID)",
-            bounds: CuaDriverWindowBounds(x: 1, y: 2, width: 100, height: 80),
+            bounds: bounds,
             isOnScreen: isOnScreen
         )
     }

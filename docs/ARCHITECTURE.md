@@ -66,9 +66,11 @@
 - `cua-driver serve --no-relaunch --socket <path>` 是 foreground 进程，不 fork、不 daemonize、不 re-exec，主线程保留 `NSApplication` accessory runtime，Unix socket accept loop 在后台 dispatch queue 上执行。
 - daemon IPC 使用一连接一请求的 AF_UNIX stream socket，frame 为 4-byte big-endian length prefix + UTF-8 JSON body，并拒绝超过 64 MB 的 frame。
 - server 在 socket 目录内持有 `cua-driver.lock` 的 non-blocking exclusive `flock`，默认 pidfile 是同目录 `cua-driver.pid`，SIGTERM/SIGINT 会清理 socket 和 pidfile。
-- daemon verbs 当前包含 `status`、`check_permissions`、`get_cursor_position`、`list_windows` 和 `screenshot`；`check_permissions` 的成功授权输出保持纯布尔字段，避免 granted case 出现 `false` / `denied` 这类 supervisor denial regex 关键词。
+- daemon verbs 当前包含 `status`、`check_permissions`、`get_cursor_position`、`list_windows`、`screenshot`、`get_window_state` 和 `click`；`check_permissions` 的成功授权输出保持纯布尔字段，避免 granted case 出现 `false` / `denied` 这类 supervisor denial regex 关键词。
 - `list_windows` 通过 `CGWindowListCopyWindowInfo(.optionAll)` 暴露 layer 0 real windows，并在每个条目上保留 `is_on_screen`，供外部 supervisor 选择可截图窗口。
 - `screenshot` 优先用 ScreenCaptureKit `SCScreenshotManager` 按 `window_id` 捕获；任何 SCK 失败都会 fallback 到 `CGWindowListCreateImage`，并在响应里标明 `capture_path` 为 `sck` 或 `cgwindowlist`。CLI `call --screenshot-out-file` 会把响应里的 base64 `image` 解码落盘。
+- `get_window_state` 通过目标 `pid` 的 `AXWindows` 解析指定 `window_id`，优先使用 `_AXUIElementGetWindow`，不可用时用 CGWindowList 的 frame/title 回退匹配；读取树前会 best-effort 打开 `AXManualAccessibility` / `AXEnhancedUserInterface`，并只遍历该窗口 subtree。响应里的 `screenshot_width` / `screenshot_height` 是 daemon `click` 的坐标空间：窗口 bounds(point) 乘 backing scale 得到 raw pixels，再按最长边不超过 1568 等比缩小。
+- daemon `click` 支持上一轮 `get_window_state` 产生的 `element_index` 和响应截图空间里的 `x/y` 坐标。`element_index` 走缓存的 AX element `kAXPressAction`，坐标点击走 `CGEvent.postToPid(pid)` 定向 mouseDown/mouseUp，不 raise/focus window，也不移动用户真实指针。
 
 ### 3. Tool Service 层
 
