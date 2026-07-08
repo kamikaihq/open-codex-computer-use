@@ -1,5 +1,7 @@
 import Darwin
 import Foundation
+import ApplicationServices
+import ImageIO
 import XCTest
 @testable import OpenComputerUseKit
 
@@ -108,12 +110,145 @@ final class CuaDriverVerbTests: XCTestCase {
         XCTAssertEqual(error?["message"] as? String, "Unknown verb: not_real")
     }
 
+    func testListWindowsAppliesPidFilterAndPreservesOnScreenFlag() throws {
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [
+                testWindow(windowID: 1, pid: 10, isOnScreen: false),
+                testWindow(windowID: 2, pid: 20, isOnScreen: true),
+            ])
+        )
+
+        let response = handler.responseEnvelope(verb: "list_windows", args: ["pid": 20])
+        let windows = try XCTUnwrap(response["windows"] as? [[String: Any]])
+        XCTAssertEqual(windows.count, 1)
+        XCTAssertEqual(windows[0]["window_id"] as? Int, 2)
+        XCTAssertEqual(windows[0]["pid"] as? Int, 20)
+        XCTAssertEqual(windows[0]["is_on_screen"] as? Bool, true)
+    }
+
+    func testScreenshotResolvesPidFromWindowIDAndDefaultsToJPEG() throws {
+        let capturer = StubWindowCapturer()
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [testWindow(windowID: 7, pid: 42)]),
+            windowCapturer: capturer
+        )
+
+        let response = handler.responseEnvelope(verb: "screenshot", args: ["window_id": 7])
+
+        XCTAssertEqual(capturer.capturedWindows.map(\.pid), [42])
+        XCTAssertEqual(capturer.capturedFormats, [.jpeg])
+        XCTAssertEqual(response["format"] as? String, "jpeg")
+        XCTAssertEqual(response["width"] as? Int, 2)
+        XCTAssertEqual(response["height"] as? Int, 1)
+        XCTAssertEqual(response["capture_path"] as? String, "fake")
+        XCTAssertEqual(response["image"] as? String, Data([0xff, 0xd8, 0xff]).base64EncodedString())
+    }
+
+    func testScreenshotUnknownWindowReturnsWindowNotFoundEnvelope() throws {
+        let handler = CuaDriverVerbHandler(windowProvider: StubWindowProvider(windows: []))
+
+        let response = handler.responseEnvelope(verb: "screenshot", args: ["window_id": 404])
+        let error = try XCTUnwrap(response["error"] as? [String: Any])
+
+        XCTAssertEqual(error["code"] as? String, "window_not_found")
+    }
+
+    func testScreenshotUsesRequestedPNGAndPlumbsBase64AndDimensions() throws {
+        let capturer = StubWindowCapturer(
+            screenshot: CuaDriverCapturedScreenshot(
+                imageData: Data([0x89, 0x50, 0x4e, 0x47]),
+                format: .png,
+                width: 11,
+                height: 12,
+                capturePath: "cgwindowlist"
+            )
+        )
+        let handler = CuaDriverVerbHandler(
+            windowProvider: StubWindowProvider(windows: [testWindow(windowID: 8, pid: 50)]),
+            windowCapturer: capturer
+        )
+
+        let response = handler.responseEnvelope(verb: "screenshot", args: ["window_id": 8, "format": "png"])
+
+        XCTAssertEqual(capturer.capturedFormats, [.png])
+        XCTAssertEqual(response["image"] as? String, Data([0x89, 0x50, 0x4e, 0x47]).base64EncodedString())
+        XCTAssertEqual(response["format"] as? String, "png")
+        XCTAssertEqual(response["width"] as? Int, 11)
+        XCTAssertEqual(response["height"] as? Int, 12)
+        XCTAssertEqual(response["capture_path"] as? String, "cgwindowlist")
+    }
+
+    func testSystemScreenshotCaptureSkipsWithoutScreenRecordingPermission() throws {
+        guard CGPreflightScreenCaptureAccess() else {
+            throw XCTSkip("Screen Recording permission is not granted")
+        }
+
+        let provider = SystemCuaDriverWindowProvider()
+        guard let window = provider.listWindows(pid: nil).first(where: { $0.isOnScreen }) else {
+            throw XCTSkip("No on-screen windows available to capture")
+        }
+
+        let screenshot = try SystemCuaDriverWindowCapturer().capture(window: window, format: .jpeg)
+        XCTAssertFalse(screenshot.imageData.isEmpty)
+        XCTAssertEqual(screenshot.format, .jpeg)
+        XCTAssertGreaterThan(screenshot.width, 0)
+        XCTAssertGreaterThan(screenshot.height, 0)
+        XCTAssertNotNil(CGImageSourceCreateWithData(screenshot.imageData as CFData, nil))
+    }
+
     private struct StubPermissionChecker: CuaDriverPermissionChecking {
         let status: CuaDriverPermissionStatus
 
         func checkPermissions(prompt: Bool) -> CuaDriverPermissionStatus {
             status
         }
+    }
+
+    private struct StubWindowProvider: CuaDriverWindowProviding {
+        let windows: [CuaDriverWindowInfo]
+
+        func listWindows(pid: Int?) -> [CuaDriverWindowInfo] {
+            windows.filter { pid == nil || $0.pid == pid }
+        }
+
+        func window(windowID: Int, pid: Int?) -> CuaDriverWindowInfo? {
+            listWindows(pid: pid).first { $0.windowID == windowID }
+        }
+    }
+
+    private final class StubWindowCapturer: CuaDriverWindowCapturing, @unchecked Sendable {
+        private let screenshot: CuaDriverCapturedScreenshot
+        var capturedWindows: [CuaDriverWindowInfo] = []
+        var capturedFormats: [CuaDriverScreenshotFormat] = []
+
+        init(
+            screenshot: CuaDriverCapturedScreenshot = CuaDriverCapturedScreenshot(
+                imageData: Data([0xff, 0xd8, 0xff]),
+                format: .jpeg,
+                width: 2,
+                height: 1,
+                capturePath: "fake"
+            )
+        ) {
+            self.screenshot = screenshot
+        }
+
+        func capture(window: CuaDriverWindowInfo, format: CuaDriverScreenshotFormat) throws -> CuaDriverCapturedScreenshot {
+            capturedWindows.append(window)
+            capturedFormats.append(format)
+            return screenshot
+        }
+    }
+
+    private func testWindow(windowID: Int, pid: Int, isOnScreen: Bool = true) -> CuaDriverWindowInfo {
+        CuaDriverWindowInfo(
+            windowID: windowID,
+            pid: pid,
+            appName: "Example",
+            title: "Window \(windowID)",
+            bounds: CuaDriverWindowBounds(x: 1, y: 2, width: 100, height: 80),
+            isOnScreen: isOnScreen
+        )
     }
 }
 
@@ -172,6 +307,10 @@ final class CuaDriverLifecycleIntegrationTests: XCTestCase {
         XCTAssertEqual(statusObject["version"] as? String, CuaDriverConstants.version)
         XCTAssertNotNil(statusObject["pid"])
 
+        if CGPreflightScreenCaptureAccess() {
+            try runScreenshotSmoke(binary: binary, socketPath: socketURL.path, directory: tempDirectory)
+        }
+
         server.terminate()
         XCTAssertTrue(waitForExit(server, timeout: 5), "server did not exit after SIGTERM")
         XCTAssertEqual(server.terminationStatus, 0)
@@ -180,6 +319,42 @@ final class CuaDriverLifecycleIntegrationTests: XCTestCase {
 
         let downStatus = try runBinary(binary, arguments: ["status", "--socket", socketURL.path])
         XCTAssertNotEqual(downStatus.exitCode, 0)
+    }
+
+    private func runScreenshotSmoke(binary: URL, socketPath: String, directory: URL) throws {
+        let listWindows = try runBinary(binary, arguments: ["call", "list_windows", "{}", "--socket", socketPath])
+        XCTAssertEqual(listWindows.exitCode, 0, listWindows.stderr)
+
+        let listObject = try CuaDriverJSON.object(from: Data(listWindows.stdout.utf8))
+        let windows = try XCTUnwrap(listObject["windows"] as? [[String: Any]])
+        guard let window = windows.first(where: { $0["is_on_screen"] as? Bool == true }),
+              let windowID = window["window_id"] as? Int
+        else {
+            throw XCTSkip("No on-screen windows available to capture")
+        }
+
+        let outputURL = directory.appendingPathComponent("m1.jpg")
+        let screenshot = try runBinary(
+            binary,
+            arguments: [
+                "call",
+                "screenshot",
+                #"{"window_id":\#(windowID),"format":"jpeg"}"#,
+                "--socket",
+                socketPath,
+                "--screenshot-out-file",
+                outputURL.path,
+            ]
+        )
+        XCTAssertEqual(screenshot.exitCode, 0, screenshot.stderr)
+        let imageData = try Data(contentsOf: outputURL)
+        XCTAssertFalse(imageData.isEmpty)
+        XCTAssertNotNil(CGImageSourceCreateWithData(imageData as CFData, nil))
+
+        let response = try CuaDriverJSON.object(from: Data(screenshot.stdout.utf8))
+        XCTAssertEqual(response["format"] as? String, "jpeg")
+        XCTAssertGreaterThan(response["width"] as? Int ?? 0, 0)
+        XCTAssertGreaterThan(response["height"] as? Int ?? 0, 0)
     }
 
     private func cuaDriverBinaryURL() throws -> URL {

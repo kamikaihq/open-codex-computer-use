@@ -61,15 +61,21 @@ public struct SystemCuaDriverPermissionChecker: CuaDriverPermissionChecking {
 
 public struct CuaDriverVerbHandler: Sendable {
     private let permissionChecker: any CuaDriverPermissionChecking
+    private let windowProvider: any CuaDriverWindowProviding
+    private let windowCapturer: any CuaDriverWindowCapturing
     private let pidProvider: @Sendable () -> Int32
     private let cursorPositionProvider: @Sendable () -> CGPoint?
 
     public init(
         permissionChecker: any CuaDriverPermissionChecking = SystemCuaDriverPermissionChecker(),
+        windowProvider: any CuaDriverWindowProviding = SystemCuaDriverWindowProvider(),
+        windowCapturer: any CuaDriverWindowCapturing = SystemCuaDriverWindowCapturer(),
         pidProvider: @escaping @Sendable () -> Int32 = { getpid() },
         cursorPositionProvider: @escaping @Sendable () -> CGPoint? = { CGEvent(source: nil)?.location }
     ) {
         self.permissionChecker = permissionChecker
+        self.windowProvider = windowProvider
+        self.windowCapturer = windowCapturer
         self.pidProvider = pidProvider
         self.cursorPositionProvider = cursorPositionProvider
     }
@@ -119,6 +125,13 @@ public struct CuaDriverVerbHandler: Sendable {
                 "x": Double(location.x),
                 "y": Double(location.y),
             ]
+        case "list_windows":
+            let pid = intArgument(args["pid"])
+            return [
+                "windows": windowProvider.listWindows(pid: pid).map(\.jsonObject),
+            ]
+        case "screenshot":
+            return screenshotResponse(args: args)
         default:
             return errorEnvelope(code: "unknown_verb", message: "Unknown verb: \(verb)")
         }
@@ -135,6 +148,47 @@ public struct CuaDriverVerbHandler: Sendable {
 
     private func errorEnvelope(code: String, message: String) -> [String: Any] {
         Self.errorEnvelope(code: code, message: message)
+    }
+
+    private func screenshotResponse(args: [String: Any]) -> [String: Any] {
+        guard let windowID = intArgument(args["window_id"] ?? args["id"]) else {
+            return errorEnvelope(code: "invalid_request", message: "screenshot requires integer field 'window_id'")
+        }
+
+        let pid = intArgument(args["pid"])
+        guard let window = windowProvider.window(windowID: windowID, pid: pid) else {
+            return errorEnvelope(code: "window_not_found", message: "Window not found: \(windowID)")
+        }
+
+        let format: CuaDriverScreenshotFormat
+        if let rawFormat = args["format"] as? String {
+            guard let parsedFormat = CuaDriverScreenshotFormat(rawValue: rawFormat.lowercased()) else {
+                return errorEnvelope(code: "invalid_request", message: "screenshot format must be 'jpeg' or 'png'")
+            }
+            format = parsedFormat
+        } else {
+            format = .jpeg
+        }
+
+        do {
+            return try windowCapturer.capture(window: window, format: format).jsonObject
+        } catch {
+            return errorEnvelope(
+                code: "capture_failed",
+                message: (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            )
+        }
+    }
+}
+
+private func intArgument(_ value: Any?) -> Int? {
+    switch value {
+    case let int as Int:
+        return int
+    case let number as NSNumber:
+        return number.intValue
+    default:
+        return nil
     }
 }
 
