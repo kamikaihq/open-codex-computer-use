@@ -8,3 +8,4 @@ artifacts/codex-dumps/
 research/
 __pycache__/
 *.pyc
+dist/
