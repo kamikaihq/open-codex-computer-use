@@ -20,18 +20,25 @@ final class CuaDriverFramingTests: XCTestCase {
         let second = Data(#"{"two":2}"#.utf8)
         let combined = try CuaDriverFraming.encode(first) + CuaDriverFraming.encode(second)
 
+        // Frame layout: 4-byte header + 9-byte body = 13 bytes per frame.
         var decoder = CuaDriverFraming.Decoder()
         for byte in combined.prefix(3) {
             try decoder.append(Data([byte]))
         }
         XCTAssertNil(try decoder.nextFrame())
 
+        // 3 + 8 = 11 bytes buffered: header complete, body still 2 bytes short.
         try decoder.append(combined.dropFirst(3).prefix(8))
+        XCTAssertNil(try decoder.nextFrame())
+
+        // Completes frame one and delivers part of frame two's header.
+        try decoder.append(combined.dropFirst(11).prefix(6))
         XCTAssertEqual(try decoder.nextFrame(), first)
         XCTAssertNil(try decoder.nextFrame())
 
-        try decoder.append(combined.dropFirst(11))
+        try decoder.append(combined.dropFirst(17))
         XCTAssertEqual(try decoder.nextFrame(), second)
+        XCTAssertNil(try decoder.nextFrame())
     }
 
     func testFrameDecoderRejectsOversizePrefix() throws {
@@ -113,8 +120,10 @@ final class CuaDriverVerbTests: XCTestCase {
 final class CuaDriverLifecycleIntegrationTests: XCTestCase {
     func testSocketLifecycleAgainstBuiltBinary() throws {
         let binary = try cuaDriverBinaryURL()
-        let tempDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("cua-driver-tests-\(UUID().uuidString)", isDirectory: true)
+        // Keep this path SHORT: unix sun_path caps at ~104 bytes and CI's
+        // NSTemporaryDirectory() alone can exceed it.
+        let tempDirectory = URL(fileURLWithPath: "/tmp", isDirectory: true)
+            .appendingPathComponent("cua-t-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
