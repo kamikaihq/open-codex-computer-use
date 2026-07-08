@@ -211,8 +211,46 @@ public struct SystemCuaDriverWindowCapturer: CuaDriverWindowCapturing {
     }
 
     public func capture(displayRegion: CuaDriverDisplayRegion, format: CuaDriverScreenshotFormat) throws -> CuaDriverCapturedScreenshot {
-        let image = try captureDisplayRegionWithCGWindowList(displayRegion.bounds.cgRect)
-        return try encode(image: image, format: format, capturePath: "cgwindowlist_display_region")
+        // SCK first, matching the window path: CGWindowListCreateImage can block
+        // indefinitely on the SkyLight main connection in some spawn contexts.
+        do {
+            let image = try captureDisplayRegionWithScreenCaptureKit(displayRegion.bounds.cgRect)
+            return try encode(image: image, format: format, capturePath: "sck_display_region")
+        } catch {
+            let image = try captureDisplayRegionWithCGWindowList(displayRegion.bounds.cgRect)
+            return try encode(image: image, format: format, capturePath: "cgwindowlist_display_region")
+        }
+    }
+
+    private func captureDisplayRegionWithScreenCaptureKit(_ region: CGRect) throws -> CGImage {
+        try BlockingAsyncBridge.run(timeout: timeout) {
+            let shareableContent = try await SCShareableContent.current
+            guard let display = shareableContent.displays.first(where: { $0.frame.intersects(region) })
+                ?? shareableContent.displays.first
+            else {
+                throw CuaDriverScreenshotError.captureFailed("ScreenCaptureKit exposed no displays")
+            }
+
+            let configuration = SCStreamConfiguration()
+            let scaleFactor = bestEffortScaleFactor(for: region)
+            // sourceRect is in display-local points (display.frame is CG global).
+            let localRegion = CGRect(
+                x: region.origin.x - display.frame.origin.x,
+                y: region.origin.y - display.frame.origin.y,
+                width: region.width,
+                height: region.height
+            ).intersection(CGRect(origin: .zero, size: display.frame.size))
+            guard !localRegion.isEmpty else {
+                throw CuaDriverScreenshotError.captureFailed("Display region is outside every display")
+            }
+            configuration.sourceRect = localRegion
+            configuration.width = max(1, Int(ceil(localRegion.width * scaleFactor)))
+            configuration.height = max(1, Int(ceil(localRegion.height * scaleFactor)))
+            configuration.showsCursor = false
+
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        }
     }
 
     private func captureWithScreenCaptureKit(window: CuaDriverWindowInfo) throws -> CGImage {

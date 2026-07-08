@@ -128,22 +128,50 @@ public func cuaDriverParseHexColor(_ rawValue: String) -> CuaDriverParsedHexColo
     )
 }
 
-public func cuaDriverRunOnMain<T: Sendable>(_ body: @escaping @MainActor () throws -> T) throws -> T {
+public struct CuaDriverMainThreadUnavailable: Error, LocalizedError {
+    public var errorDescription: String? {
+        "Main thread did not respond in time (AppKit may still be initializing); retry shortly"
+    }
+}
+
+public func cuaDriverRunOnMain<T: Sendable>(
+    timeout: TimeInterval = 5,
+    _ body: @escaping @MainActor () throws -> T
+) throws -> T {
     if Thread.isMainThread {
         return try MainActor.assumeIsolated {
             try body()
         }
     }
 
-    var result: Result<T, Error>?
-    DispatchQueue.main.sync {
+    // A bare DispatchQueue.main.sync wedges the (serial) socket queue forever if
+    // AppKit init stalls — e.g. NSApplication.shared blocking on a TCC/SkyLight
+    // preflight in a hostile spawn context. Time out and surface an error instead.
+    let box = CuaDriverResultBox<T>()
+    let semaphore = DispatchSemaphore(value: 0)
+    DispatchQueue.main.async {
         MainActor.assumeIsolated {
-            result = Result {
-                try body()
-            }
+            box.store(Result { try body() })
         }
+        semaphore.signal()
     }
-    return try result!.get()
+    guard semaphore.wait(timeout: .now() + timeout) == .success, let result = box.take() else {
+        throw CuaDriverMainThreadUnavailable()
+    }
+    return try result.get()
+}
+
+private final class CuaDriverResultBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<T, Error>?
+
+    func store(_ value: Result<T, Error>) {
+        lock.withLock { result = value }
+    }
+
+    func take() -> Result<T, Error>? {
+        lock.withLock { result }
+    }
 }
 
 public func cuaDriverDispatchMainAndWait(

@@ -25,7 +25,10 @@ public enum CuaDriverCLI {
                 return 0
             case "call":
                 let options = try parseCallOptions(Array(arguments.dropFirst()))
-                let response = try CuaDriverClient(socketPath: options.socketPath).send(
+                // Verbs can legitimately take seconds (cursor glide, SCK capture,
+                // AppKit init after a fresh spawn); only `status` stays at the
+                // snappy default so supervision probes fail fast.
+                let response = try CuaDriverClient(socketPath: options.socketPath, timeout: 15).send(
                     verb: options.verb,
                     args: options.args
                 )

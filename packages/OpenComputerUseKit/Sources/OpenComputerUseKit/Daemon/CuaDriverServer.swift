@@ -188,12 +188,15 @@ public final class CuaDriverServer {
 
 @MainActor
 public func runCuaDriverServer(socketPath: String, pidFilePath: String?) throws -> Never {
-    _ = NSApplication.shared.setActivationPolicy(.accessory)
-
+    // Bind the socket BEFORE touching NSApplication: AppKit init can stall for
+    // seconds on TCC/SkyLight preflights in some spawn contexts, and the
+    // supervisor's status probes must succeed the moment the daemon is up.
+    // Non-AppKit verbs are served off the main thread and never wait on this.
     let server = CuaDriverServer(socketPath: socketPath, pidFilePath: pidFilePath)
     try server.start()
     server.installTerminationHandlers()
 
+    _ = NSApplication.shared.setActivationPolicy(.accessory)
     NSApplication.shared.run()
     server.stop()
     exit(0)
