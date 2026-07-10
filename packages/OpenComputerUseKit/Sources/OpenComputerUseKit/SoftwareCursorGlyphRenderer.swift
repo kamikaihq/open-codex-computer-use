@@ -58,12 +58,27 @@ private enum SoftwareCursorGlyphColors {
 enum SoftwareCursorGlyphRenderer {
     nonisolated(unsafe) private static let referenceImage = loadReferenceCursorWindowImage()
 
+    /// Peak uniform scale added at the top of a click pulse: cursor grows to 1.5x.
+    static let clickBumpScale: CGFloat = 0.5
+
     static func draw(
         in bounds: CGRect,
         context: CGContext,
         state: SoftwareCursorGlyphRenderState
     ) {
         let drawingState = state.appKitDrawingState
+
+        // Click bump: grow the whole cursor to 1.5x at pulse peak, anchored at the
+        // tip so the click point stays put while the glyph pops.
+        context.saveGState()
+        defer { context.restoreGState() }
+        if drawingState.clickProgress > 0 {
+            let bump = 1 + (drawingState.clickProgress * clickBumpScale)
+            let anchor = SoftwareCursorGlyphMetrics.tipAnchor
+            context.translateBy(x: anchor.x, y: anchor.y)
+            context.scaleBy(x: bump, y: bump)
+            context.translateBy(x: -anchor.x, y: -anchor.y)
+        }
 
         if let override = SoftwareCursorArtworkOverrideStore.current {
             drawOverride(

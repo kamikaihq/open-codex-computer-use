@@ -17,7 +17,7 @@ public enum CuaDriverProtocolError: Error, LocalizedError {
 
 public enum CuaDriverConstants {
     // Must match the release tag: the bridge resolver pins on status.version.
-    public static let version = "1.0.0"
+    public static let version = "1.1.0"
 }
 
 public struct CuaDriverPermissionStatus: Equatable, Sendable {
