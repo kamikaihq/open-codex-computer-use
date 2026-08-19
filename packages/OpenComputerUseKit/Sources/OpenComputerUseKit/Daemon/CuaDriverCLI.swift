@@ -23,6 +23,8 @@ public enum CuaDriverCLI {
                 let response = try CuaDriverClient(socketPath: options.socketPath).send(verb: "status", args: [:])
                 try validateStatusResponse(response)
                 return 0
+            case "history":
+                return try runHistoryCommand(Array(arguments.dropFirst()))
             case "call":
                 let options = try parseCallOptions(Array(arguments.dropFirst()))
                 // Verbs can legitimately take seconds (cursor glide, SCK capture,
@@ -73,6 +75,91 @@ public enum CuaDriverCLI {
         let args: [String: Any]
         let socketPath: String
         let screenshotOutFile: String?
+    }
+
+    // MARK: Computer History
+
+    /// `cua-driver history <status|list [n]|show <seq>|enable|disable|pause|resume|delete --yes>`
+    /// Thin client over the daemon's history verbs; read verbs are safe, the
+    /// lifecycle verbs are user-consent operations.
+    private static func runHistoryCommand(_ arguments: [String]) throws -> Int32 {
+        var positionals: [String] = []
+        var socketPath: String?
+        var confirmed = false
+        var index = 0
+        while index < arguments.count {
+            switch arguments[index] {
+            case "--socket":
+                socketPath = try value(after: "--socket", in: arguments, index: &index)
+            case "--yes":
+                confirmed = true
+                index += 1
+            case "--json":
+                // Output is always structured JSON; accepted for compatibility.
+                index += 1
+            default:
+                if arguments[index].hasPrefix("--") {
+                    throw CLIError("unknown history option: \(arguments[index])")
+                }
+                positionals.append(arguments[index])
+                index += 1
+            }
+        }
+
+        guard let subcommand = positionals.first else {
+            throw CLIError("history requires a subcommand: status, list, show, enable, disable, pause, resume, delete")
+        }
+
+        let verb: String
+        var args: [String: Any] = [:]
+        switch subcommand {
+        case "status":
+            verb = "history_status"
+        case "list":
+            verb = "history_query"
+            if positionals.count > 1 {
+                guard let limit = Int(positionals[1]), limit >= 1, limit <= 200 else {
+                    throw CLIError("history list count must be an integer between 1 and 200")
+                }
+                args["limit"] = limit
+            }
+        case "show":
+            guard positionals.count > 1, let sequence = Int(positionals[1]), sequence >= 1 else {
+                throw CLIError("history show requires a sequence number >= 1")
+            }
+            verb = "history_query"
+            args = ["limit": 1, "since_sequence": sequence, "until_sequence": sequence]
+        case "enable":
+            verb = "history_enable"
+        case "disable":
+            verb = "history_disable"
+        case "pause":
+            verb = "history_pause"
+        case "resume":
+            verb = "history_resume"
+        case "delete":
+            guard confirmed else {
+                throw CLIError("history delete is destructive; pass --yes to confirm")
+            }
+            verb = "history_delete"
+            args = ["confirm": true]
+        default:
+            throw CLIError("unknown history subcommand: \(subcommand)")
+        }
+
+        guard let socketPath else {
+            throw CLIError("history requires --socket <path>")
+        }
+
+        let response = try CuaDriverClient(socketPath: socketPath, timeout: 15).send(verb: verb, args: args)
+        print(try CuaDriverJSON.text(from: response))
+        if let error = response["error"] as? [String: Any] {
+            if let message = error["message"] as? String {
+                writeStderr(message)
+            }
+            return 1
+        }
+        return 0
     }
 
     private struct CLIError: Error, LocalizedError {

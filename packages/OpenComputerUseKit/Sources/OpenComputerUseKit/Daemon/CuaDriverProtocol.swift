@@ -17,7 +17,7 @@ public enum CuaDriverProtocolError: Error, LocalizedError {
 
 public enum CuaDriverConstants {
     // Must match the release tag: the bridge resolver pins on status.version.
-    public static let version = "1.1.0"
+    public static let version = "1.2.0"
 }
 
 public struct CuaDriverPermissionStatus: Equatable, Sendable {
@@ -75,6 +75,7 @@ public struct CuaDriverVerbHandler: Sendable {
     private let cursorSession: CuaDriverCursorSession
     private let pidProvider: @Sendable () -> Int32
     private let cursorPositionProvider: @Sendable () -> CGPoint?
+    private let historyService: HistoryService
 
     public init(
         permissionChecker: any CuaDriverPermissionChecking = SystemCuaDriverPermissionChecker(),
@@ -90,7 +91,8 @@ public struct CuaDriverVerbHandler: Sendable {
         elementInteractor: any CuaDriverElementInteracting = SystemCuaDriverElementInteractor(),
         cursorSession: CuaDriverCursorSession = CuaDriverCursorSession(),
         pidProvider: @escaping @Sendable () -> Int32 = { getpid() },
-        cursorPositionProvider: @escaping @Sendable () -> CGPoint? = { CGEvent(source: nil)?.location }
+        cursorPositionProvider: @escaping @Sendable () -> CGPoint? = { CGEvent(source: nil)?.location },
+        historyService: HistoryService = HistoryService()
     ) {
         self.permissionChecker = permissionChecker
         self.windowProvider = windowProvider
@@ -106,6 +108,7 @@ public struct CuaDriverVerbHandler: Sendable {
         self.cursorSession = cursorSession
         self.pidProvider = pidProvider
         self.cursorPositionProvider = cursorPositionProvider
+        self.historyService = historyService
     }
 
     public func responseEnvelope(for requestData: Data) -> [String: Any] {
@@ -163,19 +166,33 @@ public struct CuaDriverVerbHandler: Sendable {
         case "get_window_state":
             return windowStateResponse(args: args)
         case "click":
-            return clickResponse(args: args)
+            return recordingHistory(capability: "computer.pointer.click", args: args) { clickResponse(args: args) }
         case "type_text":
-            return typeTextResponse(args: args)
+            return recordingHistory(capability: "computer.keyboard.type", args: args) { typeTextResponse(args: args) }
         case "set_value":
-            return setValueResponse(args: args)
+            return recordingHistory(capability: "computer.element.set_value", args: args) { setValueResponse(args: args) }
         case "press_key":
-            return pressKeyResponse(args: args)
+            return recordingHistory(capability: "computer.keyboard.press", args: args) { pressKeyResponse(args: args) }
         case "scroll":
-            return scrollResponse(args: args)
+            return recordingHistory(capability: "computer.pointer.scroll", args: args) { scrollResponse(args: args) }
         case "drag":
-            return dragResponse(args: args)
+            return recordingHistory(capability: "computer.pointer.drag", args: args) { dragResponse(args: args) }
         case "perform_secondary_action":
-            return performSecondaryActionResponse(args: args)
+            return recordingHistory(capability: "computer.element.secondary_action", args: args) { performSecondaryActionResponse(args: args) }
+        case "history_status":
+            return historyService.statusResponse()
+        case "history_query":
+            return historyService.queryResponse(args: args)
+        case "history_enable":
+            return historyService.enableResponse()
+        case "history_disable":
+            return historyService.lifecycleResponse(operation: "disable")
+        case "history_pause":
+            return historyService.lifecycleResponse(operation: "pause")
+        case "history_resume":
+            return historyService.lifecycleResponse(operation: "resume")
+        case "history_delete":
+            return historyService.deleteResponse(args: args)
         case "set_agent_cursor_enabled":
             return setAgentCursorEnabledResponse(args: args)
         case "set_agent_cursor_style":
@@ -185,6 +202,41 @@ public struct CuaDriverVerbHandler: Sendable {
         default:
             return errorEnvelope(code: "unknown_verb", message: "Unknown verb: \(verb)")
         }
+    }
+
+    /// Computer History capture around a state-changing verb. Metadata only:
+    /// the recorded event carries capability, target-application identity, and
+    /// the fixed outcome — never arguments, text, coordinates, or results.
+    /// Capture must never fail or delay the originating action.
+    private func recordingHistory(
+        capability: String,
+        args: [String: Any],
+        _ body: () -> [String: Any]
+    ) -> [String: Any] {
+        guard historyService.isCapturing else {
+            return body()
+        }
+        let actionID = historyService.makeActionID()
+        let pid = intArgument(args["pid"])
+        historyService.recordActionStarted(actionID: actionID, capability: capability, pid: pid)
+        let response = body()
+        let route: String?
+        switch response["method"] as? String {
+        case "ax_press":
+            route = "accessibility"
+        case "coordinate":
+            route = "coordinate"
+        default:
+            route = nil
+        }
+        historyService.recordActionCompleted(
+            actionID: actionID,
+            capability: capability,
+            pid: pid,
+            effect: response["error"] == nil ? "confirmed" : "failed",
+            route: route
+        )
+        return response
     }
 
     public static func errorEnvelope(code: String, message: String) -> [String: Any] {
