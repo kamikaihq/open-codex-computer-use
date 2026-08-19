@@ -90,7 +90,14 @@ public final class CuaDriverServer {
         source.resume()
     }
 
-    public func installTerminationHandlers(on queue: DispatchQueue = .main) {
+    /// `beforeExit` runs after the listener is torn down and before the process
+    /// exits. SIGTERM is the normal way this daemon dies, and the signal handler
+    /// exits directly, so anything that must be durable at shutdown belongs here
+    /// rather than after the AppKit run loop.
+    public func installTerminationHandlers(
+        on queue: DispatchQueue = .main,
+        beforeExit: @escaping @Sendable () -> Void = {}
+    ) {
         signal(SIGTERM, SIG_IGN)
         signal(SIGINT, SIG_IGN)
 
@@ -98,6 +105,7 @@ public final class CuaDriverServer {
             let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: queue)
             source.setEventHandler { [weak self] in
                 self?.stop()
+                beforeExit()
                 exit(0)
             }
             source.resume()
@@ -192,12 +200,25 @@ public func runCuaDriverServer(socketPath: String, pidFilePath: String?) throws 
     // seconds on TCC/SkyLight preflights in some spawn contexts, and the
     // supervisor's status probes must succeed the moment the daemon is up.
     // Non-AppKit verbs are served off the main thread and never wait on this.
-    let server = CuaDriverServer(socketPath: socketPath, pidFilePath: pidFilePath)
+    let historyService = HistoryService()
+    let server = CuaDriverServer(
+        socketPath: socketPath,
+        pidFilePath: pidFilePath,
+        handler: CuaDriverVerbHandler(historyService: historyService)
+    )
     try server.start()
-    server.installTerminationHandlers()
+    server.installTerminationHandlers {
+        historyService.recordSession(phase: "ended")
+        historyService.flush()
+    }
+    historyService.recordSession(phase: "started")
 
     _ = NSApplication.shared.setActivationPolicy(.accessory)
     NSApplication.shared.run()
+    // Reached only if AppKit stops the run loop on its own; the signal path
+    // above is what actually runs on shutdown.
+    historyService.recordSession(phase: "ended")
+    historyService.flush()
     server.stop()
     exit(0)
 }
